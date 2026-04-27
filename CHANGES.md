@@ -1273,4 +1273,11 @@ wires into `StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` p
   coroutine builders `process_io` → `concurrency`; PHP `Cache::` / Ruby `Rails.cache.`
   `state_mutation` → `caching`
 
+## Sprint 28 — Guard Propagation: `reachable_guards` (v3.58)
 
+- New `reachable_guards: Set[str]` field on every `SymbolNode`
+- `_propagate_guard_signals()`: post-extraction pass that traverses the reverse call graph
+  (depth ≤ 2) and collects `SEMANTIC_GUARD_SIGNALS` from callers onto each node
+- Called between `_extract_semantic_signals()` and `_compute_risk_scores()` in the main loop
+- Surfaces in JSON output (`reachable_guards` key, omitted when empty) and `--why` display
+- Foundation for Sprint 29 architectural combination-rule warnings

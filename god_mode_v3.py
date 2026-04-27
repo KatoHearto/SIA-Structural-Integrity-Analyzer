@@ -452,6 +452,7 @@ class SymbolNode:
     raw_string_refs: Set[str] = field(default_factory=set)
     resolved_string_refs: Set[str] = field(default_factory=set)
     plugin_data: Dict[str, object] = field(default_factory=dict)
+    reachable_guards: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -726,6 +727,7 @@ class StructuralIntegrityAnalyzerV3:
         self._compute_git_hotspots(enabled=include_git_hotspots)
         self._compute_coords()
         self._extract_semantic_signals()
+        self._propagate_guard_signals()
         self._compute_risk_scores()
         self._extract_behavioral_flows()
 
@@ -741,7 +743,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.57",
+                "version": "3.58",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -5030,6 +5032,33 @@ class StructuralIntegrityAnalyzerV3:
                     "guard_signals": [signal for signal in signals if signal in SEMANTIC_GUARD_SIGNALS],
                 }
 
+    def _propagate_guard_signals(self) -> None:
+        """Populate reachable_guards on each node: guard signals from callers at depth <= 2."""
+        rev_adj: Dict[str, Set[str]] = defaultdict(set)
+        for src, dsts in self.adj.items():
+            for dst in dsts:
+                if src != dst:
+                    rev_adj[dst].add(src)
+
+        for node_id, node in self.nodes.items():
+            node.reachable_guards = set()
+            depth1: Set[str] = rev_adj.get(node_id, set())
+            for caller_id in depth1:
+                caller = self.nodes.get(caller_id)
+                if caller:
+                    node.reachable_guards.update(
+                        s for s in caller.semantic_signals
+                        if s in SEMANTIC_GUARD_SIGNALS
+                    )
+            for caller_id in depth1:
+                for caller2_id in rev_adj.get(caller_id, set()):
+                    caller2 = self.nodes.get(caller2_id)
+                    if caller2:
+                        node.reachable_guards.update(
+                            s for s in caller2.semantic_signals
+                            if s in SEMANTIC_GUARD_SIGNALS
+                        )
+
     def _extract_python_semantic_spans(
         self,
         node: SymbolNode,
@@ -6237,6 +6266,7 @@ class StructuralIntegrityAnalyzerV3:
             "risk_score": node.risk_score,
             "reasons": node.reasons,
             "semantic_signals": list(node.semantic_signals),
+            **({"reachable_guards": sorted(node.reachable_guards)} if node.reachable_guards else {}),
             "resolved_string_refs": sorted(node.resolved_string_refs),
             **({"plugin_data": dict(node.plugin_data)} if node.plugin_data else {}),
             "semantic_evidence_spans": list(node.semantic_evidence_spans),
@@ -6297,6 +6327,7 @@ class StructuralIntegrityAnalyzerV3:
                     "coord": node.coord,
                     "reasons": node.reasons,
                     "semantic_signals": list(node.semantic_signals),
+                    **({"reachable_guards": sorted(node.reachable_guards)} if node.reachable_guards else {}),
                     "semantic_summary": dict(node.semantic_summary),
                     "semantic_weight": node.semantic_weight,
                     "contained_semantic_signals": list(node.contained_semantic_signals),
@@ -13939,6 +13970,9 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
         if signals:
             print()
             print(f"Semantic signals: {', '.join(signals)}")
+        reachable = sorted(str(g) for g in risk_entry.get("reachable_guards", []) if g)
+        if reachable:
+            print(f"Guard coverage (from callers, depth ≤ 2): {', '.join(reachable)}")
     elif node_entry:
         lang = node_entry.get("language", "?")
         kind = node_entry.get("kind", "?")
@@ -13962,6 +13996,9 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
         if signals:
             print()
             print(f"Semantic signals: {', '.join(signals)}")
+        reachable = sorted(str(g) for g in node_entry.get("reachable_guards", []) if g)
+        if reachable:
+            print(f"Guard coverage (from callers, depth ≤ 2): {', '.join(reachable)}")
 
     detail_entry = node_entry if isinstance(node_entry, dict) else (risk_entry if isinstance(risk_entry, dict) else None)
     if detail_entry and detail_entry.get("kind") == "doctype":
