@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# SIA runtime output
+sia_report.json
+sia_report_*.json
+sia_report_bundle*/
+sia_self_*.json
+sia_self_bundle/
+*.sia_report.json
+llm_bundle*/
+ask_bundle*/
+ask_*.json
+worker_output_a.md
+worker_output_b.md
+worker_result*.json
+worker_validation*.json
+
+# SIA analysis artefacts (sprint runs, test runs, exploratory outputs)
+sia_polyglot_*.json
+sia_polyglot_full_v*.json
+sia_workspace_v*.json
+sia_fixture_report.json
+sia_multilang_report.json
+sia_bundle_*/
+nomicon_bundle_*/
+nomicon_report.json
+test_out.json
+test_refactor.json
+test_refactor_bundle/
+test_s16.json
+test_s16_bundle/
+test_s17_a_bundle/
+test_*.json
+tmp_*.json
+
+# SIA internal fixtures (not the polyglot fixture)
+.sia_fixture/
+.multilang_fixture/
+
+# misc generated
+requirements.txt
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
