@@ -1,0 +1,12 @@
+{
+  "doctype": "DocType",
+  "name": "Sales Order",
+  "module": "Selling",
+  "fields": [
+    {"fieldtype": "Link", "fieldname": "customer", "label": "Customer", "options": "Customer"},
+    {"fieldtype": "Table", "fieldname": "items", "label": "Items", "options": "Sales Order Item"},
+    {"fieldtype": "Currency", "fieldname": "total", "label": "Total"}
+  ],
+  "issingle": 0,
+  "is_virtual": 0
+}

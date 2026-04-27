@@ -1,0 +1,14 @@
+{
+  "doctype": "DocType",
+  "name": "Sales Order Item",
+  "module": "Selling",
+  "fields": [
+    {"fieldtype": "Data", "fieldname": "item_code", "label": "Item Code"},
+    {"fieldtype": "Link", "fieldname": "customer", "label": "Customer", "options": "Customer"},
+    {"fieldtype": "Float", "fieldname": "qty", "label": "Quantity"},
+    {"fieldtype": "Currency", "fieldname": "rate", "label": "Rate"},
+    {"fieldtype": "Currency", "fieldname": "amount", "label": "Amount"}
+  ],
+  "issingle": 0,
+  "is_virtual": 0
+}

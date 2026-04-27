@@ -5,9 +5,9 @@
 [![GitHub](https://img.shields.io/badge/GitHub-KatoHearto%2FSIA--Structural--Integrity--Analyzer-181717?logo=github)](https://github.com/KatoHearto/SIA-Structural-Integrity-Analyzer)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
 ![Languages](https://img.shields.io/badge/Languages-9-green)
-![Version](https://img.shields.io/badge/Version-3.52-orange)
+![Version](https://img.shields.io/badge/Version-3.55-orange)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
-![Lines](https://img.shields.io/badge/Source-13%2C609%20lines-informational)
+![Lines](https://img.shields.io/badge/Source-14%2C150%20lines-informational)
 
 ---
 
@@ -80,7 +80,7 @@ python god_mode_v3.py ./my-project --exclude vendor --exclude build
 - **PageRank** — recursive importance in the dependency graph
 - **Betweenness centrality** — how often this node sits on the shortest path between others
 - **Git hotspot score** — change frequency from `git log` (optional, `--no-git-hotspots` to disable)
-- **Semantic signals** — 14 behavioral categories detected per symbol (see below)
+- **Semantic signals** — 16 behavioral categories detected per symbol (see below)
 
 ### Semantic Signals
 
@@ -89,6 +89,7 @@ network_io       database_io      filesystem_io    process_io
 config_access    input_boundary   output_boundary  validation_guard
 auth_guard       error_handling   serialization    deserialization
 state_mutation   time_or_randomness
+dynamic_dispatch orm_dynamic_load
 ```
 
 Each signal is detected by language-specific pattern matching across all 9 languages.
@@ -101,7 +102,7 @@ Each signal is detected by language-specific pattern matching across all 9 langu
 
 ```json
 {
-  "meta": { "version": "3.52", "node_count": 360, "edge_count": 616 },
+  "meta": { "version": "3.54", "node_count": 360, "edge_count": 616 },
   "top_risks": [
     {
       "symbol": "UserService.processPayment",
@@ -178,6 +179,25 @@ Patterns are merged with any `--exclude` flags you pass on the CLI.
 
 ---
 
+## Plugin: Frappe
+
+Activate with `--plugin frappe` to parse Frappe DocType JSON definitions:
+
+```bash
+python god_mode_v3.py ./my-frappe-app --plugin frappe
+```
+
+SIA will:
+- Create `kind="doctype"` graph nodes for every DocType JSON found
+- Add `doctype_link` edges for Link fields and `doctype_child` edges for Table fields
+- Resolve each DocType to its Python controller via the Frappe path convention
+- Detect `hooks.py` string references and ORM event triggers automatically
+- Resolve Frappe ORM string-path references (e.g. `frappe.get_doc("Customer")`) to DocType nodes
+
+If SIA detects a Frappe project without the flag, it prints an advisory to stderr.
+
+---
+
 ## CLI Reference
 
 | Flag | Default | Description |
@@ -192,6 +212,7 @@ Patterns are merged with any `--exclude` flags you pass on the CLI.
 | `--bundle-dir DIR` | — | Write full LLM bundle to directory |
 | `--exclude PATTERN` | — | Glob exclusion (repeatable) |
 | `--filter-language LANGS` | — | Comma-separated language whitelist |
+| `--plugin NAMES` | — | Activate optional plugins (currently: `frappe`) |
 | `--diff OLD NEW` | — | Compare two SIA JSON reports |
 | `--why SYMBOL REPORT` | — | Explain a symbol's risk score |
 | `--validate-worker-result` | — | Validate a filled worker result |
@@ -203,7 +224,7 @@ Patterns are merged with any `--exclude` flags you pass on the CLI.
 SIA can analyze its own source. Running it on `god_mode_v3.py`:
 
 ```
-nodes=360  edges=616  cycles=1  parse_errors=0
+nodes=379  edges=657  cycles=1  parse_errors=0
 ```
 
 The one detected cycle is an intentional mutual recursion in the JS/TS barrel resolver, guarded by a depth limit of 8 hops.
@@ -214,7 +235,7 @@ Top-ranked method: `_build_ask_context_pack` (score=48.5, Ce=29, instability=0.9
 
 ## Development History
 
-SIA was developed in **24 passes** (3 autonomous runs + 22 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
+SIA was developed in **29 passes** (3 autonomous runs + 26 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
 
 | Sprints | Deliverable |
 |---------|-------------|
@@ -226,6 +247,8 @@ SIA was developed in **24 passes** (3 autonomous runs + 22 directed sprints) usi
 | Sprint 20 | Kotlin (7th language), `--exclude` |
 | Sprint 21 | PHP (8th language), `--markdown`, `--why` |
 | Sprint 22 | Ruby (9th language), `.siaignore`, `--filter-language` |
+| Sprint 23–24 | Frappe Plugin: DocTypes, Link/Child fields, Controllers |
+| Sprint 25 | Frappe Plugin: ORM resolution + Semantic enrichment |
 
 Full changelog: [`CHANGES.md`](CHANGES.md)  
 Sprint briefings: [`docs/sprints/`](docs/sprints/)

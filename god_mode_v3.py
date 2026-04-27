@@ -70,6 +70,12 @@ LANGUAGE_BY_SUFFIX = {
     ".rb": "Ruby",
 }
 JS_LIKE_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+_FRAPPE_ORM_LOAD_RE = re.compile(
+    r'\bfrappe\.(?:get_doc|new_doc|get_cached_doc|get_last_doc|get_single|get_all|get_list|get_value)\s*\(\s*["\']([^"\']+)["\']',
+)
+_FRAPPE_DB_RE = re.compile(
+    r'\bfrappe\.db\.(?:get_value|set_value|get_all|exists|count|delete|get_singles_value)\s*\(\s*["\']([^"\']+)["\']',
+)
 JS_CALL_KEYWORDS = {
     "if",
     "for",
@@ -162,6 +168,11 @@ RESOLUTION_CONFIDENCE = {
     "java_di_primary": (0.83, "medium_high"),
     "java_di_qualifier": (0.81, "medium_high"),
     "java_di_unique_impl": (0.78, "medium_high"),
+    "string_ref": (0.75, "medium_high"),
+    "doctype_link": (1.0, "very_high"),
+    "doctype_child": (1.0, "very_high"),
+    "doctype_controller": (0.9, "high"),
+    "orm_load": (0.85, "high"),
     "heuristic": (0.65, "medium"),
     "ambiguous_candidates": (0.0, "ambiguous"),
 }
@@ -219,6 +230,8 @@ SEMANTIC_SIGNAL_WEIGHTS = {
     "serialization": 1.4,
     "deserialization": 1.5,
     "time_or_randomness": 1.2,
+    "dynamic_dispatch": 2.0,
+    "orm_dynamic_load": 2.5,
 }
 SEMANTIC_SIGNAL_ORDER = {
     signal: index
@@ -239,7 +252,7 @@ SEMANTIC_SIDE_EFFECT_SIGNALS = {
 }
 SEMANTIC_BOUNDARY_SIGNALS = {"input_boundary", "output_boundary"}
 SEMANTIC_GUARD_SIGNALS = {"validation_guard", "auth_guard", "error_handling"}
-SEMANTIC_EXTERNAL_IO_SIGNALS = {"network_io", "database_io", "filesystem_io", "process_io"}
+SEMANTIC_EXTERNAL_IO_SIGNALS = {"network_io", "database_io", "filesystem_io", "process_io", "orm_dynamic_load"}
 SEMANTIC_CRITICAL_SIGNALS = {
     "auth_guard",
     "database_io",
@@ -251,6 +264,8 @@ SEMANTIC_CRITICAL_SIGNALS = {
     "process_io",
     "state_mutation",
     "validation_guard",
+    "dynamic_dispatch",
+    "orm_dynamic_load",
 }
 BEHAVIORAL_FLOW_STEP_ORDER = {
     "input_boundary": 0,
@@ -260,6 +275,7 @@ BEHAVIORAL_FLOW_STEP_ORDER = {
     "auth_guard": 4,
     "state_read": 5,
     "state_mutation": 6,
+    "orm_dynamic_load": 7,
     "database_io": 7,
     "network_io": 8,
     "filesystem_io": 9,
@@ -268,6 +284,7 @@ BEHAVIORAL_FLOW_STEP_ORDER = {
     "output_boundary": 12,
     "error_handling": 13,
     "time_or_randomness": 14,
+    "dynamic_dispatch": 15,
 }
 BEHAVIORAL_FLOW_STEP_SIGNALS = set(BEHAVIORAL_FLOW_STEP_ORDER)
 SEMANTIC_AUTH_KEYWORDS = ("auth", "role", "permission", "scope", "token", "session", "principal", "credential")
@@ -425,6 +442,9 @@ class SymbolNode:
     contained_semantic_weight: float = 0.0
     behavioral_flow_steps: List[Dict[str, object]] = field(default_factory=list)
     behavioral_flow_summary: Dict[str, object] = field(default_factory=dict)
+    raw_string_refs: Set[str] = field(default_factory=set)
+    resolved_string_refs: Set[str] = field(default_factory=set)
+    plugin_data: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -613,12 +633,42 @@ class ImportCollector(ast.NodeVisitor):
         return
 
 
+_STRING_REF_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,}$")
+
+
+class StringRefCollector(ast.NodeVisitor):
+    """Collects string literals that look like dotted importable paths."""
+
+    def __init__(self) -> None:
+        self.refs: Set[str] = set()
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and _STRING_REF_RE.match(node.value):
+            self.refs.add(node.value)
+        self.generic_visit(node)
+
+    def visit_Str(self, node: ast.Str) -> None:  # type: ignore[attr-defined]
+        if _STRING_REF_RE.match(node.s):
+            self.refs.add(node.s)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
 class StructuralIntegrityAnalyzerV3:
     def __init__(
         self,
         root_dir: str,
         exclude_globs: Optional[List[str]] = None,
         filter_languages: Optional[List[str]] = None,
+        plugins: Optional[List[str]] = None,
     ) -> None:
         self.root_dir = os.path.abspath(root_dir)
         self.nodes: Dict[str, SymbolNode] = {}
@@ -643,6 +693,9 @@ class StructuralIntegrityAnalyzerV3:
         self.git_tracked_file_count: int = 0
         self.exclude_globs: List[str] = list(exclude_globs or [])
         self.filter_languages: Optional[Set[str]] = set(filter_languages) if filter_languages else None
+        self.active_plugins: Set[str] = set(plugin.lower() for plugin in (plugins or []))
+        self.frappe_doctype_name_to_node: Dict[str, str] = {}
+        self.frappe_doctype_snake_to_node: Dict[str, str] = {}
         self.go_root_module: str = self._discover_go_root_module()
         self.js_resolver_configs: List[Dict[str, object]] = self._discover_js_resolver_configs()
 
@@ -681,7 +734,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.52",
+                "version": "3.56",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -767,6 +820,13 @@ class StructuralIntegrityAnalyzerV3:
                     _lang = LANGUAGE_BY_SUFFIX[suffix]
                     if self.filter_languages is None or _lang in self.filter_languages:
                         self._parse_non_python_file(rel_path, _lang)
+        if "frappe" in self.active_plugins:
+            self._scan_frappe_json_files()
+        elif self._detect_frappe_project():
+            print(
+                "[SIA] Frappe project detected. Re-run with --plugin frappe for DocType analysis.",
+                file=sys.stderr,
+            )
 
     def _discover_go_root_module(self) -> str:
         go_mod_path = os.path.join(self.root_dir, "go.mod")
@@ -819,6 +879,104 @@ class StructuralIntegrityAnalyzerV3:
             )
 
         return sorted(configs, key=lambda item: len(str(item["config_dir"])), reverse=True)
+
+    def _detect_frappe_project(self) -> bool:
+        """Return True if root looks like a Frappe bench or app."""
+        for name in ("apps.txt", "sites/apps.txt"):
+            if os.path.isfile(os.path.join(self.root_dir, name)):
+                return True
+        for name in ("pyproject.toml", "requirements.txt", "setup.py"):
+            path = os.path.join(self.root_dir, name)
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        content = handle.read()
+                    if "frappe" in content.lower():
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def _scan_frappe_json_files(self) -> None:
+        """Walk the project and register all Frappe DocType JSON files as graph nodes."""
+        import fnmatch as _fnmatch
+        norm_excludes = [p.rstrip("/\\") for p in self.exclude_globs]
+        for root, dirs, files in os.walk(self.root_dir):
+            dirs[:] = [d for d in dirs if not should_ignore_dir(d)]
+            if norm_excludes:
+                dirs[:] = [d for d in dirs if not any(_fnmatch.fnmatch(d, pattern) for pattern in norm_excludes)]
+            for file_name in files:
+                if not file_name.endswith(".json"):
+                    continue
+                full_path = os.path.join(root, file_name)
+                rel_path = os.path.relpath(full_path, self.root_dir)
+                try:
+                    with open(full_path, encoding="utf-8") as handle:
+                        data = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if data.get("doctype") != "DocType":
+                    continue
+                self._parse_frappe_doctype_file(rel_path, data)
+
+    @staticmethod
+    def _frappe_snake(name: str) -> str:
+        return name.lower().replace(" ", "_").replace("-", "_")
+
+    def _parse_frappe_doctype_file(self, rel_path: str, data: Dict[str, object]) -> None:
+        """Register a Frappe DocType JSON as a graph node."""
+        dt_name = str(data.get("name", ""))
+        if not dt_name:
+            return
+        dt_snake = self._frappe_snake(dt_name)
+        dt_module = str(data.get("module", ""))
+
+        controller_path = str(Path(rel_path).with_suffix(".py").as_posix())
+        if Path(rel_path).stem != dt_snake:
+            controller_path = str((Path(rel_path).parent / f"{dt_snake}.py").as_posix())
+
+        link_refs: List[str] = []
+        child_refs: List[str] = []
+        for field_def in data.get("fields", []):
+            if not isinstance(field_def, dict):
+                continue
+            field_type = str(field_def.get("fieldtype", ""))
+            options = str(field_def.get("options", "")).strip()
+            if not options:
+                continue
+            if field_type == "Link":
+                link_refs.append(options)
+            elif field_type in ("Table", "Table MultiSelect"):
+                child_refs.append(options)
+
+        node_id = f"frappe.doctype.{dt_snake}:{dt_snake}"
+        node = SymbolNode(
+            node_id=node_id,
+            module=f"frappe.doctype.{dt_snake}",
+            qualname=dt_snake,
+            kind="doctype",
+            file=rel_path,
+            lines=[1, 1],
+            class_context=None,
+            imports_modules={},
+            imports_symbols={},
+            language="FrappeDocType",
+            plugin_data={
+                "frappe_doctype_name": dt_name,
+                "frappe_module": dt_module,
+                "frappe_snake": dt_snake,
+                "frappe_link_refs": link_refs,
+                "frappe_child_refs": child_refs,
+                "frappe_controller_path": controller_path,
+                "frappe_is_single": bool(data.get("issingle")),
+                "frappe_is_virtual": bool(data.get("is_virtual")),
+            },
+        )
+        self.nodes[node_id] = node
+        self.frappe_doctype_name_to_node[dt_name] = node_id
+        self.frappe_doctype_snake_to_node[dt_snake] = node_id
 
     def _load_js_compiler_options(self, config_path: str, visited: Set[str]) -> Dict[str, object]:
         normalized = os.path.normpath(os.path.abspath(config_path))
@@ -883,6 +1041,26 @@ class StructuralIntegrityAnalyzerV3:
 
         module = path_to_module(rel_path)
         imports_modules, imports_symbols = self._extract_imports(tree, module)
+        raw_imports_set = (
+            set(imports_modules)
+            | set(imports_modules.values())
+            | set(imports_symbols)
+            | set(imports_symbols.values())
+        )
+        module_string_refs = self._string_refs_from_statements(tree.body) - raw_imports_set
+        if module_string_refs:
+            self.nodes[f"{module}:{source_qualname(rel_path)}"] = SymbolNode(
+                node_id=f"{module}:{source_qualname(rel_path)}",
+                module=module,
+                qualname=source_qualname(rel_path),
+                kind="module",
+                file=rel_path,
+                lines=[1, max(1, len(source.splitlines()))],
+                class_context=None,
+                imports_modules=imports_modules,
+                imports_symbols=imports_symbols,
+                raw_string_refs=module_string_refs,
+            )
         self._collect_definitions(
             module=module,
             rel_path=rel_path,
@@ -912,6 +1090,12 @@ class StructuralIntegrityAnalyzerV3:
                     else:
                         imports_symbols[local] = alias.name
         return imports_modules, imports_symbols
+
+    def _string_refs_from_statements(self, statements: Iterable[ast.stmt]) -> Set[str]:
+        collector = StringRefCollector()
+        for stmt in statements:
+            collector.visit(stmt)
+        return set(collector.refs)
 
     def _extract_local_imports(
         self,
@@ -958,6 +1142,13 @@ class StructuralIntegrityAnalyzerV3:
                     local_symbols,
                 )
                 class_calls = self._calls_from_body(stmt.body)
+                class_raw_imports_set = (
+                    set(class_imports_modules)
+                    | set(class_imports_modules.values())
+                    | set(class_imports_symbols)
+                    | set(class_imports_symbols.values())
+                )
+                class_string_refs = self._string_refs_from_statements(stmt.body) - class_calls - class_raw_imports_set
                 class_bases = {name for name in (ref_name(base) for base in stmt.bases) if name}
                 self.nodes[class_id] = SymbolNode(
                     node_id=class_id,
@@ -971,6 +1162,7 @@ class StructuralIntegrityAnalyzerV3:
                     imports_symbols=class_imports_symbols,
                     raw_calls=class_calls,
                     raw_bases=class_bases,
+                    raw_string_refs=class_string_refs,
                 )
                 self._collect_definitions(
                     module=module,
@@ -992,6 +1184,13 @@ class StructuralIntegrityAnalyzerV3:
                     local_symbols,
                 )
                 fn_calls = self._calls_from_body(stmt.body)
+                fn_raw_imports_set = (
+                    set(fn_imports_modules)
+                    | set(fn_imports_modules.values())
+                    | set(fn_imports_symbols)
+                    | set(fn_imports_symbols.values())
+                )
+                fn_string_refs = self._string_refs_from_statements(stmt.body) - fn_calls - fn_raw_imports_set
                 kind = "async_function" if isinstance(stmt, ast.AsyncFunctionDef) else "function"
                 self.nodes[fn_id] = SymbolNode(
                     node_id=fn_id,
@@ -1004,6 +1203,7 @@ class StructuralIntegrityAnalyzerV3:
                     imports_modules=fn_imports_modules,
                     imports_symbols=fn_imports_symbols,
                     raw_calls=fn_calls,
+                    raw_string_refs=fn_string_refs,
                 )
 
     def _parse_non_python_file(self, rel_path: str, language: str) -> None:
@@ -1076,6 +1276,7 @@ class StructuralIntegrityAnalyzerV3:
             raw_imports=set(payload.get("raw_imports", set())),
             raw_calls=set(payload.get("raw_calls", set())),
             raw_bases=set(payload.get("raw_bases", set())),
+            raw_string_refs=set(payload.get("raw_string_refs", set())),
         )
         return node_id
 
@@ -1219,6 +1420,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
             "export_bindings": export_bindings,
             "export_star_specs": export_star_specs,
         }
@@ -1249,6 +1451,8 @@ class StructuralIntegrityAnalyzerV3:
                 continue
             body = content[open_brace + 1:close_brace]
             member_types = self._extract_js_like_class_member_types(body)
+            raw_calls = self._extract_js_like_top_level_calls(body)
+            raw_imports = set(imports_modules.values()) | set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1259,8 +1463,9 @@ class StructuralIntegrityAnalyzerV3:
                     "imports_symbols": dict(imports_symbols),
                     "member_types": member_types,
                     "declared_symbols": [],
-                    "raw_calls": self._extract_js_like_top_level_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": {base_name} if base_name else set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(content, match.start(), close_brace),
                 }
             )
@@ -1289,6 +1494,8 @@ class StructuralIntegrityAnalyzerV3:
             if close_brace < 0:
                 continue
             body = content[open_brace + 1:close_brace]
+            raw_calls = self._extract_js_like_calls(body)
+            raw_imports = set(imports_modules.values()) | set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1297,8 +1504,9 @@ class StructuralIntegrityAnalyzerV3:
                     "imports_modules": dict(imports_modules),
                     "imports_symbols": dict(imports_symbols),
                     "declared_symbols": [],
-                    "raw_calls": self._extract_js_like_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(content, match.start(), close_brace),
                 }
             )
@@ -1324,6 +1532,8 @@ class StructuralIntegrityAnalyzerV3:
                 if end_index < 0:
                     end_index = len(content) - 1
                 body = content[idx:end_index + 1]
+            raw_calls = self._extract_js_like_calls(body)
+            raw_imports = set(imports_modules.values()) | set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1332,8 +1542,9 @@ class StructuralIntegrityAnalyzerV3:
                     "imports_modules": dict(imports_modules),
                     "imports_symbols": dict(imports_symbols),
                     "declared_symbols": [],
-                    "raw_calls": self._extract_js_like_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(content, match.start(), end_index),
                 }
             )
@@ -1377,6 +1588,8 @@ class StructuralIntegrityAnalyzerV3:
             if marker in seen:
                 continue
             seen.add(marker)
+            raw_calls = self._extract_js_like_calls(body)
+            raw_imports = set(imports_modules.values()) | set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1387,8 +1600,9 @@ class StructuralIntegrityAnalyzerV3:
                     "imports_symbols": dict(imports_symbols),
                     "member_types": dict(member_types),
                     "declared_symbols": [],
-                    "raw_calls": self._extract_js_like_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(full_content, start_index, end_index),
                 }
             )
@@ -1421,6 +1635,8 @@ class StructuralIntegrityAnalyzerV3:
             if marker in seen:
                 continue
             seen.add(marker)
+            raw_calls = self._extract_js_like_calls(body)
+            raw_imports = set(imports_modules.values()) | set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1431,8 +1647,9 @@ class StructuralIntegrityAnalyzerV3:
                     "imports_symbols": dict(imports_symbols),
                     "member_types": dict(member_types),
                     "declared_symbols": [],
-                    "raw_calls": self._extract_js_like_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(full_content, start_index, end_index),
                 }
             )
@@ -1646,6 +1863,19 @@ class StructuralIntegrityAnalyzerV3:
             calls.add(match.group(1))
         return calls
 
+    @staticmethod
+    def _harvest_string_refs(body: str, exclude: Optional[Set[str]] = None) -> Set[str]:
+        """Return dotted-path string literals from body that look like importable paths."""
+        found: Set[str] = set()
+        for match in re.finditer(r'["\']([A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,})["\']', body):
+            candidate = match.group(1)
+            if len(candidate.split(".")) > 8:
+                continue
+            found.add(candidate)
+        if exclude:
+            found -= exclude
+        return found
+
     def _parse_js_import_bindings(
         self,
         lhs: str,
@@ -1706,6 +1936,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": self._dedupe(funcs + types)[:20],
             "raw_imports": raw_imports,
             "raw_bases": set(),
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _parse_java_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
@@ -1761,6 +1992,7 @@ class StructuralIntegrityAnalyzerV3:
             "raw_calls": set(),
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _parse_csharp_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
@@ -1796,6 +2028,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _parse_kotlin_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
@@ -1833,6 +2066,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _parse_php_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
@@ -1872,6 +2106,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _parse_ruby_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
@@ -1902,6 +2137,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
             "raw_bases": raw_bases,
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _extract_java_symbol_payloads(
@@ -1949,6 +2185,8 @@ class StructuralIntegrityAnalyzerV3:
                 field_qualifiers.setdefault(field_name, qualifier)
             annotation_block = self._extract_java_leading_annotation_block(content, match.start())
             annotations, bean_name, di_primary = self._extract_java_component_metadata(type_name, annotation_block)
+            raw_calls = self._extract_java_top_level_calls(body)
+            raw_imports = set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -1965,8 +2203,9 @@ class StructuralIntegrityAnalyzerV3:
                     "bean_name": bean_name,
                     "is_abstract": type_kind == "class" and bool(re.search(r"\babstract\b", match.group(0))),
                     "di_primary": di_primary,
-                    "raw_calls": self._extract_java_top_level_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": raw_bases,
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(content, match.start(), close_brace),
                 }
             )
@@ -2064,6 +2303,7 @@ class StructuralIntegrityAnalyzerV3:
                     "di_primary": False,
                     "raw_calls": set(),
                     "raw_bases": raw_bases,
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=set(imports_symbols.values())),
                     "lines": self._span_to_lines(content, type_match.start(), close_brace),
                 }
             )
@@ -2111,6 +2351,7 @@ class StructuralIntegrityAnalyzerV3:
                         "di_primary": False,
                         "raw_calls": raw_calls,
                         "raw_bases": set(),
+                        "raw_string_refs": self._harvest_string_refs(method_body, exclude=raw_calls | set(imports_symbols.values())),
                         "lines": self._span_to_lines(content, abs_start, abs_end),
                     }
                 )
@@ -2184,6 +2425,7 @@ class StructuralIntegrityAnalyzerV3:
                     "di_primary": False,
                     "raw_calls": set(),
                     "raw_bases": raw_bases,
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=set(imports_symbols.values())),
                     "lines": self._span_to_lines(content, type_match.start(), close_brace),
                 }
             )
@@ -2203,6 +2445,11 @@ class StructuralIntegrityAnalyzerV3:
                 else:
                     method_close = self._find_matching_brace(body, method_open)
                 abs_end = body_offset + (method_close if method_close >= 0 else method_match.end())
+                method_body = (
+                    body[method_open + 1:method_close]
+                    if method_open >= 0 and method_close >= 0
+                    else body[method_match.start():method_match.end()]
+                )
                 payloads.append(
                     {
                         "module": module_name,
@@ -2220,6 +2467,7 @@ class StructuralIntegrityAnalyzerV3:
                         "di_primary": False,
                         "raw_calls": set(),
                         "raw_bases": set(),
+                        "raw_string_refs": self._harvest_string_refs(method_body, exclude=set(imports_symbols.values())),
                         "lines": self._span_to_lines(content, abs_start, abs_end),
                     }
                 )
@@ -2235,8 +2483,10 @@ class StructuralIntegrityAnalyzerV3:
             fun_open = content.find("{", fun_match.start())
             if fun_open < 0:
                 fun_end = fun_match.end()
+                fun_body = content[fun_match.start():fun_match.end()]
             else:
                 fun_end = self._find_matching_brace(content, fun_open)
+                fun_body = content[fun_open + 1:fun_end] if fun_end >= 0 else content[fun_match.start():fun_match.end()]
             payloads.append(
                 {
                     "module": module_name,
@@ -2254,6 +2504,7 @@ class StructuralIntegrityAnalyzerV3:
                     "di_primary": False,
                     "raw_calls": set(),
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(fun_body, exclude=set(imports_symbols.values())),
                     "lines": self._span_to_lines(content, fun_match.start(), fun_end if fun_end >= 0 else fun_match.end()),
                 }
             )
@@ -2320,6 +2571,7 @@ class StructuralIntegrityAnalyzerV3:
                 "di_primary": False,
                 "raw_calls": set(),
                 "raw_bases": raw_bases,
+                "raw_string_refs": self._harvest_string_refs(body, exclude=set(imports_symbols.values())),
                 "lines": self._span_to_lines(content, type_match.start(), close_brace),
             })
 
@@ -2339,6 +2591,11 @@ class StructuralIntegrityAnalyzerV3:
                 else:
                     m_close = self._find_matching_brace(body, m_open)
                 abs_end = body_offset + (m_close if m_close >= 0 else method_match.end())
+                method_body = (
+                    body[m_open + 1:m_close]
+                    if m_open >= 0 and m_close >= 0
+                    else body[method_match.start():method_match.end()]
+                )
                 payloads.append({
                     "module": module_name,
                     "qualname": f"{type_name}.{method_name}",
@@ -2355,6 +2612,7 @@ class StructuralIntegrityAnalyzerV3:
                     "di_primary": False,
                     "raw_calls": set(),
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(method_body, exclude=set(imports_symbols.values())),
                     "lines": self._span_to_lines(content, abs_start, abs_end),
                 })
 
@@ -2434,6 +2692,7 @@ class StructuralIntegrityAnalyzerV3:
                 "di_primary": False,
                 "raw_calls": set(),
                 "raw_bases": raw_bases,
+                "raw_string_refs": self._harvest_string_refs(body, exclude=set(imports_symbols.values())),
                 "lines": self._span_to_lines(content, type_match.start(), block_end),
             })
 
@@ -2454,6 +2713,7 @@ class StructuralIntegrityAnalyzerV3:
                 abs_start = type_match.end() + method_match.start()
                 mend = self._ruby_find_end(body, method_match.start())
                 abs_end = type_match.end() + mend
+                method_body = body[method_match.end():mend]
                 payloads.append({
                     "module": module_name,
                     "qualname": qualname,
@@ -2470,6 +2730,7 @@ class StructuralIntegrityAnalyzerV3:
                     "di_primary": False,
                     "raw_calls": set(),
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(method_body, exclude=set(imports_symbols.values())),
                     "lines": self._span_to_lines(content, abs_start, abs_end),
                 })
 
@@ -2478,6 +2739,7 @@ class StructuralIntegrityAnalyzerV3:
                 continue
             method_name = method_match.group(3)
             mend = self._ruby_find_end(content, method_match.start())
+            method_body = content[method_match.end():mend]
             payloads.append({
                 "module": module_name,
                 "qualname": method_name,
@@ -2494,6 +2756,7 @@ class StructuralIntegrityAnalyzerV3:
                 "di_primary": False,
                 "raw_calls": set(),
                 "raw_bases": set(),
+                "raw_string_refs": self._harvest_string_refs(method_body, exclude=set(imports_symbols.values())),
                 "lines": self._span_to_lines(content, method_match.start(), mend),
             })
 
@@ -2542,6 +2805,8 @@ class StructuralIntegrityAnalyzerV3:
             start_index = body_offset + match.start()
             end_index = body_offset + close_brace
             qualname = f"{class_name}.{method_name}"
+            raw_calls = self._extract_java_calls(body)
+            raw_imports = set(imports_symbols.values())
             payloads.append(
                 {
                     "module": module_name,
@@ -2554,8 +2819,9 @@ class StructuralIntegrityAnalyzerV3:
                     "member_qualifiers": member_qualifiers,
                     "package_name": package_name,
                     "declared_symbols": [],
-                    "raw_calls": self._extract_java_calls(body),
+                    "raw_calls": raw_calls,
                     "raw_bases": set(),
+                    "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
                     "lines": self._span_to_lines(full_content, start_index, end_index),
                 }
             )
@@ -2794,6 +3060,7 @@ class StructuralIntegrityAnalyzerV3:
             "declared_symbols": self._dedupe(funcs + types)[:20],
             "raw_imports": raw_imports,
             "raw_bases": set(),
+            "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
 
     def _expand_rust_use_spec(self, spec: str) -> List[str]:
@@ -2843,10 +3110,19 @@ class StructuralIntegrityAnalyzerV3:
         self.java_member_to_node.clear()
         self.java_concrete_type_targets.clear()
         self.rust_module_to_node.clear()
+        self.frappe_doctype_name_to_node.clear()
+        self.frappe_doctype_snake_to_node.clear()
         go_candidates: Dict[str, List[str]] = defaultdict(list)
         for node_id, node in self.nodes.items():
             fq = f"{node.module}.{node.qualname}"
             self.fq_to_id[fq] = node_id
+            if node.kind == "doctype":
+                dt_name = str(node.plugin_data.get("frappe_doctype_name", ""))
+                dt_snake = str(node.plugin_data.get("frappe_snake", "")) or node.qualname
+                if dt_name:
+                    self.frappe_doctype_name_to_node[dt_name] = node_id
+                if dt_snake:
+                    self.frappe_doctype_snake_to_node[dt_snake] = node_id
             if node.language == "Python":
                 short_names = [node.qualname.split(".")[-1]]
             else:
@@ -2870,6 +3146,12 @@ class StructuralIntegrityAnalyzerV3:
             for short in short_names:
                 if short:
                     self.short_index[short].append(node_id)
+
+        for dt_name, node_id in self.frappe_doctype_name_to_node.items():
+            snake = self._frappe_snake(dt_name)
+            self.fq_to_id[snake] = node_id
+            self.fq_to_id[dt_name] = node_id
+            self.short_index[snake].append(node_id)
 
         for directory, candidates in go_candidates.items():
             selected = sorted(
@@ -2952,6 +3234,7 @@ class StructuralIntegrityAnalyzerV3:
             node.unresolved_call_details.clear()
             node.unresolved_bases.clear()
             node.unresolved_imports.clear()
+            node.resolved_string_refs.clear()
             node.recursive_self_call = False
             node.heuristic_candidates.clear()
 
@@ -3010,6 +3293,10 @@ class StructuralIntegrityAnalyzerV3:
                 node.resolved_imports.add(target)
                 self._add_edge(node_id, target, "import", outcome)
 
+        self._resolve_string_refs()
+        self._resolve_frappe_doctype_edges()
+        self._resolve_frappe_orm_calls()
+
         indegree: Dict[str, int] = {nid: 0 for nid in self.nodes}
         for src, dsts in self.adj.items():
             for dst in dsts:
@@ -3025,6 +3312,137 @@ class StructuralIntegrityAnalyzerV3:
             total = node.ca + node.ce_total
             node.instability = round(node.ce_internal / internal_total, 4) if internal_total > 0 else 0.0
             node.instability_total = round(node.ce_total / total, 4) if total > 0 else 0.0
+
+    def _resolve_string_refs(self) -> None:
+        """Resolve dotted-path string literals to graph nodes and add string_ref edges."""
+        for node_id, node in self.nodes.items():
+            node.resolved_string_refs.clear()
+            if not node.raw_string_refs:
+                continue
+            for raw in sorted(node.raw_string_refs):
+                if raw in node.raw_imports or raw in node.raw_calls:
+                    continue
+                target = self._resolve_string_ref_target(raw, node)
+                if target is None or target == node_id:
+                    continue
+                node.resolved_string_refs.add(target)
+                outcome = self._resolution(
+                    target=target,
+                    kind="string_ref",
+                    reason=f"Resolved string literal `\"{raw}\"` to symbol `{target}`.",
+                )
+                self._add_edge(node_id, target, "string_ref", outcome)
+
+    def _resolve_string_ref_target(self, raw: str, caller: SymbolNode) -> Optional[str]:
+        """Try to match a dotted string literal against known graph symbols."""
+        if raw in self.fq_to_id:
+            return self.fq_to_id[raw]
+        parts = raw.split(".")
+        for length in range(len(parts) - 1, 1, -1):
+            suffix = ".".join(parts[-length:])
+            if suffix in self.fq_to_id:
+                return self.fq_to_id[suffix]
+        last = parts[-1]
+        candidates = self.short_index.get(last, [])
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _resolve_frappe_doctype_edges(self) -> None:
+        """Add edges from DocType nodes to linked DocTypes and their controllers."""
+        if "frappe" not in self.active_plugins:
+            return
+        for node_id, node in list(self.nodes.items()):
+            if node.kind != "doctype":
+                continue
+            plugin_data = node.plugin_data
+
+            for ref_name in plugin_data.get("frappe_link_refs", []):
+                target = self.frappe_doctype_name_to_node.get(str(ref_name))
+                if target and target != node_id:
+                    outcome = self._resolution(
+                        target=target,
+                        kind="doctype_link",
+                        reason=f"Link field references DocType `{ref_name}`.",
+                    )
+                    self._add_edge(node_id, target, "doctype_link", outcome)
+
+            for ref_name in plugin_data.get("frappe_child_refs", []):
+                target = self.frappe_doctype_name_to_node.get(str(ref_name))
+                if target and target != node_id:
+                    outcome = self._resolution(
+                        target=target,
+                        kind="doctype_child",
+                        reason=f"Table field embeds child DocType `{ref_name}`.",
+                    )
+                    self._add_edge(node_id, target, "doctype_child", outcome)
+
+            controller_path = str(plugin_data.get("frappe_controller_path", ""))
+            if not controller_path:
+                continue
+            target = self.file_module_node.get(controller_path)
+            if not target:
+                target = self.file_module_node.get(controller_path.replace("/", os.sep))
+            if not target:
+                target = self._frappe_controller_symbol_for_path(controller_path)
+            if target and target != node_id:
+                outcome = self._resolution(
+                    target=target,
+                    kind="doctype_controller",
+                    reason=f"Conventional Frappe controller path `{controller_path}`.",
+                )
+                self._add_edge(node_id, target, "doctype_controller", outcome)
+
+    def _resolve_frappe_orm_calls(self) -> None:
+        """Resolve Frappe ORM string-path references to DocType nodes."""
+        if "frappe" not in self.active_plugins:
+            return
+        for node_id, node in self.nodes.items():
+            source_path = os.path.join(self.root_dir, node.file)
+            if not node.file.endswith(".py") or not os.path.exists(source_path):
+                continue
+
+            try:
+                content = Path(source_path).read_text(encoding="utf-8")
+                matches = _FRAPPE_ORM_LOAD_RE.findall(content) + _FRAPPE_DB_RE.findall(content)
+                for dt_name in matches:
+                    target = self.frappe_doctype_name_to_node.get(dt_name)
+                    if not target:
+                        target = self.frappe_doctype_name_to_node.get(self._frappe_snake(dt_name))
+
+                    if target and target != node_id:
+                        outcome = self._resolution(
+                            kind="orm_load",
+                            reason=f"Frappe ORM call references DocType `{dt_name}` via string argument.",
+                            target=target,
+                        )
+                        self._add_edge(node_id, target, "orm_load", outcome)
+            except Exception:
+                continue
+
+    def _frappe_controller_symbol_for_path(self, controller_path: str) -> Optional[str]:
+
+        normalized = Path(controller_path).as_posix()
+        candidates = [
+            node_id for node_id, node in self.nodes.items()
+            if Path(node.file).as_posix() == normalized and node.language == "Python"
+        ]
+        if not candidates:
+            return None
+        module_candidates = [node_id for node_id in candidates if self.nodes[node_id].kind == "module"]
+        if module_candidates:
+            return sorted(module_candidates)[0]
+        class_candidates = [node_id for node_id in candidates if self.nodes[node_id].kind == "class"]
+        if class_candidates:
+            return sorted(class_candidates)[0]
+        return sorted(candidates)[0]
+
+    def _incoming_string_ref_sources(self, target_id: str) -> List[str]:
+        return sorted(
+            node_id
+            for node_id, node in self.nodes.items()
+            if target_id in node.resolved_string_refs
+        )
 
     def _classify_unresolved_call(self, caller: SymbolNode, raw: str) -> str:
         if caller.language in {"JavaScript", "TypeScript"}:
@@ -4518,28 +4936,39 @@ class StructuralIntegrityAnalyzerV3:
             node.contained_semantic_weight = 0.0
 
             source_lines = self._node_source_lines(node, direct_semantics=True)
-            if not source_lines:
-                continue
 
             refs: List[Dict[str, object]] = []
-            if node.language == "Python":
-                refs = self._extract_python_semantic_spans(node, source_lines)
-            elif node.language == "Java":
-                refs = self._extract_java_semantic_spans(node, source_lines)
-            elif node.language in {"JavaScript", "TypeScript"}:
-                refs = self._extract_js_like_semantic_spans(node, source_lines)
-            elif node.language == "Go":
-                refs = self._extract_go_semantic_spans(node, source_lines)
-            elif node.language == "Rust":
-                refs = self._extract_rust_semantic_spans(node, source_lines)
-            elif node.language == "CSharp":
-                refs = self._extract_csharp_semantic_spans(node, source_lines)
-            elif node.language == "Kotlin":
-                refs = self._extract_kotlin_semantic_spans(node, source_lines)
-            elif node.language == "PHP":
-                refs = self._extract_php_semantic_spans(node, source_lines)
-            elif node.language == "Ruby":
-                refs = self._extract_ruby_semantic_spans(node, source_lines)
+            if source_lines:
+                if node.language == "Python":
+                    refs = self._extract_python_semantic_spans(node, source_lines)
+                elif node.language == "Java":
+                    refs = self._extract_java_semantic_spans(node, source_lines)
+                elif node.language in {"JavaScript", "TypeScript"}:
+                    refs = self._extract_js_like_semantic_spans(node, source_lines)
+                elif node.language == "Go":
+                    refs = self._extract_go_semantic_spans(node, source_lines)
+                elif node.language == "Rust":
+                    refs = self._extract_rust_semantic_spans(node, source_lines)
+                elif node.language == "CSharp":
+                    refs = self._extract_csharp_semantic_spans(node, source_lines)
+                elif node.language == "Kotlin":
+                    refs = self._extract_kotlin_semantic_spans(node, source_lines)
+                elif node.language == "PHP":
+                    refs = self._extract_php_semantic_spans(node, source_lines)
+                elif node.language == "Ruby":
+                    refs = self._extract_ruby_semantic_spans(node, source_lines)
+
+            string_ref_sources = self._incoming_string_ref_sources(node.node_id)
+            if string_ref_sources:
+                refs.append({
+                    "signal": "dynamic_dispatch",
+                    "file": node.file,
+                    "lines": [node.lines[0], node.lines[0]] if node.lines else [0, 0],
+                    "reason": (
+                        f"Invoked via {len(string_ref_sources)} dynamic string "
+                        f"reference(s) - renaming this symbol silently breaks callers."
+                    ),
+                })
 
             refs = self._dedupe_semantic_refs(refs, limit=12)
             io_refs = [ref for ref in refs if str(ref.get("signal", "")) in SEMANTIC_EXTERNAL_IO_SIGNALS]
@@ -4633,6 +5062,8 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"\b(?:conn|connection)\.(?:fetch|fetchrow|fetchval|execute)\s*\(", text)
             ):
                 self._record_semantic_ref(refs, node, "database_io", lineno, lineno, "Touches a database or session API.")
+            if _FRAPPE_ORM_LOAD_RE.search(text) or _FRAPPE_DB_RE.search(text):
+                self._record_semantic_ref(refs, node, "orm_dynamic_load", lineno, lineno, "Invokes Frappe ORM dynamic load.")
             if re.search(r"\bos\.(?:environ|getenv)\b", text) or re.search(r"\b(?:configparser|dotenv)\b", text) or re.search(r"\btomllib\.(?:load|loads)\s*\(", text):
                 self._record_semantic_ref(refs, node, "config_access", lineno, lineno, "Reads configuration or environment state.")
             if re.search(r"\b(?:json|pickle|yaml)\.(?:dump|dumps|safe_dump)\s*\(", text):
@@ -4677,6 +5108,18 @@ class StructuralIntegrityAnalyzerV3:
             if guard is not None:
                 signal, end_line, reason = guard
                 self._record_semantic_ref(refs, node, signal, lineno, end_line, reason)
+
+        if "frappe" in self.active_plugins and node.file.endswith("hooks.py"):
+            for index, (lineno, text) in enumerate(source_lines):
+                if re.search(r'\bdoc_events\s*=\s*\{', text):
+                    self._record_semantic_ref(refs, node, "input_boundary", lineno, lineno,
+                                             "Frappe doc_events hook — registers document event handlers.")
+                if re.search(r'\bscheduler_events\s*=\s*\{', text):
+                    self._record_semantic_ref(refs, node, "time_or_randomness", lineno, lineno,
+                                             "Frappe scheduler_events — registers time-driven tasks.")
+                if re.search(r'\boverride_whitelisted_methods\s*=\s*\{', text):
+                    self._record_semantic_ref(refs, node, "auth_guard", lineno, lineno,
+                                             "Frappe override_whitelisted_methods — alters API access control.")
         return refs
 
     def _extract_java_semantic_spans(
@@ -5621,6 +6064,7 @@ class StructuralIntegrityAnalyzerV3:
                 "unresolved_call_count": len(node.unresolved_calls),
                 "unresolved_base_count": len(node.unresolved_bases),
                 "heuristic_candidate_count": len(node.heuristic_candidates),
+                "string_ref_count": len(node.resolved_string_refs),
                 "semantic_signal_count": len(node.semantic_signals),
                 "contained_semantic_signal_count": len(node.contained_semantic_signals),
                 "behavioral_flow_step_count": len(node.behavioral_flow_steps),
@@ -5628,6 +6072,8 @@ class StructuralIntegrityAnalyzerV3:
             "risk_score": node.risk_score,
             "reasons": node.reasons,
             "semantic_signals": list(node.semantic_signals),
+            "resolved_string_refs": sorted(node.resolved_string_refs),
+            **({"plugin_data": dict(node.plugin_data)} if node.plugin_data else {}),
             "semantic_evidence_spans": list(node.semantic_evidence_spans),
             "semantic_summary": dict(node.semantic_summary),
             "semantic_weight": node.semantic_weight,
@@ -13196,6 +13642,11 @@ def _build_markdown_report(report: Dict[str, object]) -> str:
                 f"{score:.1f} | {ca} | {ce} | {inst:.2f} | {spof} |"
             )
         lines.append("")
+        lines.append(
+            "> **dynamic_dispatch** - symbol is invoked via a string literal reference; "
+            "renaming it silently breaks callers."
+        )
+        lines.append("")
 
     cycles: List[List[str]] = report.get("cycles", [])
     if cycles:
@@ -13233,6 +13684,33 @@ def _build_markdown_report(report: Dict[str, object]) -> str:
             lines.append(f"\n*...and {len(module_report) - 40} more modules.*")
         lines.append("")
 
+    doctype_nodes = [
+        n for n in report.get("nodes", [])
+        if isinstance(n, dict) and n.get("kind") == "doctype"
+    ]
+    if doctype_nodes:
+        lines.append("\n## Frappe DocType Coupling\n")
+        lines.append("| DocType | Link fields | Child tables | Controller | ORM References |")
+        lines.append("|---------|-------------|--------------|------------|----------------|")
+        for n in sorted(doctype_nodes, key=lambda x: str(x.get("qualname", ""))):
+            node_id = str(n.get("node_id", ""))
+            pd = n.get("plugin_data", {}) if isinstance(n.get("plugin_data", {}), dict) else {}
+            name = str(pd.get("frappe_doctype_name", n.get("qualname", "")))
+            links = ", ".join(str(item) for item in pd.get("frappe_link_refs", [])) or "-"
+            children = ", ".join(str(item) for item in pd.get("frappe_child_refs", [])) or "-"
+            ctrl = str(pd.get("frappe_controller_path", "-") or "-")
+
+            orm_sources = []
+            for ed in report.get("edge_details", []):
+                if str(ed.get("target")) == node_id and "string_ref" in ed.get("kinds", []):
+                    src = str(ed.get("source", ""))
+                    short_src = src.split(":")[1] if ":" in src else src
+                    orm_sources.append(f"`{short_src}`")
+            orm_refs = ", ".join(sorted(set(orm_sources))) or "-"
+
+            lines.append(f"| {name} | {links} | {children} | `{ctrl}` | {orm_refs} |")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -13254,7 +13732,7 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
 
     node_entry: Optional[Dict[str, object]] = None
     for nd in report.get("nodes", []):
-        if str(nd.get("node_id", "")) == symbol:
+        if str(nd.get("node_id", "") or nd.get("id", "") or nd.get("symbol", "")) == symbol:
             node_entry = nd
             break
 
@@ -13283,16 +13761,67 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
         print(f"  Afferent  Ca = {ca}   (symbols that depend on this one)")
         print(f"  Efferent  Ce = {ce}   (symbols this one depends on)")
         print(f"  Instability    = {inst if isinstance(inst, str) else f'{inst:.2f}'}")
+        resolved_string_refs: List[str] = []
+        if isinstance(node_entry, dict):
+            resolved_string_refs = [str(ref) for ref in node_entry.get("resolved_string_refs", []) if str(ref)]
+        elif isinstance(risk_entry, dict):
+            resolved_string_refs = [str(ref) for ref in risk_entry.get("resolved_string_refs", []) if str(ref)]
+        print(f"  Dynamic string refs  {len(resolved_string_refs)} resolved target(s)")
+        for target in sorted(resolved_string_refs):
+            print(f"    -> {target}")
         if git_h:
             print(f"  Git hotspot    = {git_h:.2f}")
         if signals:
             print()
             print(f"Semantic signals: {', '.join(signals)}")
     elif node_entry:
-        print(f"(Not in top risks - node found with risk_score={node_entry.get('risk_score', '?')})")
+        lang = node_entry.get("language", "?")
+        kind = node_entry.get("kind", "?")
+        score = float(node_entry.get("risk_score", 0.0))
+        metrics = node_entry.get("metrics", {})
+        ca = metrics.get("ca", "?")
+        ce = metrics.get("ce_total", "?")
+        inst = metrics.get("instability", "?")
+        signals = [str(s) for s in node_entry.get("semantic_signals", [])]
+        resolved_string_refs = [str(ref) for ref in node_entry.get("resolved_string_refs", []) if str(ref)]
+        print(f"(Not in top risks - node found with risk_score={score:.2f})")
+        print(f"Language: {lang}  Kind: {kind}")
+        print()
+        print("Coupling")
+        print(f"  Afferent  Ca = {ca}   (symbols that depend on this one)")
+        print(f"  Efferent  Ce = {ce}   (symbols this one depends on)")
+        print(f"  Instability    = {inst if isinstance(inst, str) else f'{inst:.2f}'}")
+        print(f"  Dynamic string refs  {len(resolved_string_refs)} resolved target(s)")
+        for target in sorted(resolved_string_refs):
+            print(f"    -> {target}")
+        if signals:
+            print()
+            print(f"Semantic signals: {', '.join(signals)}")
+
+    detail_entry = node_entry if isinstance(node_entry, dict) else (risk_entry if isinstance(risk_entry, dict) else None)
+    if detail_entry and detail_entry.get("kind") == "doctype":
+        pd = detail_entry.get("plugin_data", {})
+        if not isinstance(pd, dict):
+            pd = {}
+        print(
+            f"\nFrappe DocType: {pd.get('frappe_doctype_name', '')}  "
+            f"module={pd.get('frappe_module', '')}  "
+            f"single={pd.get('frappe_is_single', False)}  "
+            f"virtual={pd.get('frappe_is_virtual', False)}"
+        )
+        link_refs = [str(item) for item in pd.get("frappe_link_refs", [])]
+        child_refs = [str(item) for item in pd.get("frappe_child_refs", [])]
+        if link_refs:
+            print(f"  Link fields -> {', '.join(link_refs)}")
+        if child_refs:
+            print(f"  Child tables -> {', '.join(child_refs)}")
+        ctrl = str(pd.get("frappe_controller_path", ""))
+        if ctrl:
+            print(f"  Controller: {ctrl}")
 
     callers: List[str] = []
     callees: List[str] = []
+    edge_details = report.get("edge_details", [])
     for edge in report.get("edges", []):
         if isinstance(edge, dict):
             src = str(edge.get("source", ""))
@@ -13302,10 +13831,20 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
             dst = str(edge[1])
         else:
             continue
+
+        kinds = []
+        for ed in edge_details:
+            if str(ed.get("source")) == src and str(ed.get("target")) == dst:
+                kinds = ed.get("kinds", [])
+                break
+        kind_label = ""
+        if "string_ref" in kinds:
+            kind_label = " [ORM LOAD]"
+
         if dst == symbol:
-            callers.append(src)
+            callers.append(f"{src}{kind_label}")
         if src == symbol:
-            callees.append(dst)
+            callees.append(f"{dst}{kind_label}")
 
     if callers or callees:
         print()
@@ -13493,6 +14032,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--plugin",
+        default="",
+        metavar="NAMES",
+        help=(
+            "Comma-separated plugin names to activate (e.g. 'frappe'). "
+            "Currently supported: frappe."
+        ),
+    )
+    parser.add_argument(
         "--markdown",
         default="",
         metavar="PATH",
@@ -13570,6 +14118,7 @@ def main() -> None:
         args.root,
         exclude_globs=args.exclude or [],
         filter_languages=_filter_langs,
+        plugins=[p.strip() for p in args.plugin.split(",") if p.strip()] if args.plugin else None,
     )
     report = analyzer.run(
         top_n=max(1, args.top),

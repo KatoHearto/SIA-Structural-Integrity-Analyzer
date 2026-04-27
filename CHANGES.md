@@ -1,6 +1,7 @@
 # CHANGES — Autonomous Bug-Fix Pass
 
-**File audited:** `god_mode_v3.py` (11 537 lines, single source file)  
+**File audited:** `god_mode_v3.py` (14 150 lines, single source file)
+  
 **Audit scope:** Full file, every line read.
 
 ---
@@ -131,7 +132,8 @@ return list(dict.fromkeys(item for item in claims if item))[:2]
 # CHANGES — Autonomous Bug-Fix Pass (Run 2)
 
 **Date:** 2026-04-24  
-**File audited:** `god_mode_v3.py` (11 537 lines, single source file)  
+**File audited:** `god_mode_v3.py` (14 150 lines, single source file)
+  
 **Audit scope:** Full file re-read (lines 1–11 537). All five Session 1 fixes confirmed present and correct. One new bug found and fixed.
 
 **Fixture directories** (present in workspace but correctly excluded from analysis via `should_ignore_dir`):
@@ -1211,5 +1213,51 @@ session (state_mutation); rescue/raise (error_handling); render/redirect_to/puts
 Worker B: `.siaignore` file - if present in the project root, patterns (one per line, #
 comments ignored) are merged with `--exclude` patterns before scanning. `--filter-language
 LANGS` (comma-separated) restricts analysis to named languages only; wires into
-`StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` parameter. Version 3.52,
+wires into `StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` parameter. Version 3.52,
 24 passes.
+
+## Sprint 23 — Generic String-to-Symbol Resolution + `dynamic_dispatch` (v3.53)
+
+- New semantic signal `dynamic_dispatch` (weight 2.0) — fires on symbols invoked via string
+  literal references; renaming silently breaks callers
+- New `StringRefCollector` AST visitor harvests dotted-path string literals from Python bodies
+- `_harvest_string_refs()` regex helper for all non-Python languages
+- `_resolve_string_refs()` post-graph pass: matches harvested strings to known symbols, adds
+  `string_ref` edges
+- Called inside `_resolve_edges()` before Ca/Ce computation so coupling metrics include
+  string-ref edges
+- Fixture: `.polyglot_graph_fixture/pyapp/hooks.py` demonstrates Frappe/Django-style hook
+  registration; 3 string_ref edges and 3 dynamic_dispatch signals on fixture run
+
+## Sprint 24 — Frappe Plugin: Foundation + DocType JSON Parser (v3.54)
+
+- `--plugin NAMES` CLI flag; currently supports `frappe`
+- `plugin_data: Dict[str, object]` extension field on `SymbolNode` (forward-compatible)
+- DocType JSON files parsed as `kind="doctype"`, `language="FrappeDocType"` graph nodes
+- `doctype_link` edges for Link fields, `doctype_child` edges for Table fields
+- `doctype_controller` edges resolve each DocType to its Python controller class
+- Auto-detection: advisory printed to stderr when Frappe project detected without `--plugin`
+- `--why` extended to show DocType info (module, Link fields, Child tables, controller path)
+- Markdown report: Frappe DocType Coupling section added
+- Fixture: `.frappe_fixture/` with Customer, Sales Order, Sales Order Item DocTypes
+
+## Sprint 25 — Frappe Plugin: ORM Resolution + Semantic Enrichment (v3.55)
+
+- New semantic signal `orm_dynamic_load` (weight 2.5) — fires on Python symbols using
+  Frappe ORM calls (`frappe.get_doc`, `frappe.get_all`, `frappe.db.*`)
+- `_resolve_frappe_orm_calls()`: adds `orm_load` edges from Python callers to DocType nodes
+  (only when `--plugin frappe` active)
+- `_extract_python_semantic_spans`: Frappe ORM patterns emit `orm_dynamic_load`
+  unconditionally; `doc_events` → `input_boundary`, `scheduler_events` →
+  `time_or_randomness`, `override_whitelisted_methods` → `auth_guard` when plugin active
+- `"orm_load": (0.85, "high")` added to `RESOLUTION_CONFIDENCE`
+
+## Sprint 26 — Frappe Plugin: Polish + JS Cross-Language + Documentation (v3.56)
+
+- Fixture `sales_order.py`: added `frappe.get_all("Sales Order Item", ...)` → `orm_load`
+  edge to `sales_order_item` DocType
+- New JS fixture `sales_order_form.js`: `frappe.call({method: "..."})` strings resolve to
+  Python methods via Sprint 23 `string_ref` mechanism (cross-language edges, no Frappe-
+  specific JS code needed)
+- Documentation: `CHANGES.md`, `WORKER_GUIDE.md`, `README.md` updated through Sprint 26
+

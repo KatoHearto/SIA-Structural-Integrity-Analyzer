@@ -6,6 +6,7 @@
 Single-file Python tool: `god_mode_v3.py` (currently ~11,576 lines).
 
 Supported languages: Python, JavaScript/TypeScript, Go, Java, Rust, C#, Kotlin, PHP, Ruby.
+Optional plugin: --plugin frappe (DocType JSON, ORM resolution, hooks.py enrichment).
 
 Produces: symbol graphs, coupling metrics (Ca/Ce/instability), Tarjan SCC cycle detection, PageRank, betweenness
 centrality, layered architecture diagrams, and LLM context bundles for downstream AI workers.
@@ -190,9 +191,9 @@ python god_mode_v3.py .polyglot_graph_fixture --out test_report.json --bundle-di
 
 ## Current state
 
-- Version: **3.52**
+- Version: **3.56**
 - Status: **complete** — all 14 semantic signals covered in all 5 language extractors; all known pattern gaps closed
-- Sprint history: 24 passes (Runs 1–3 autonomous, Sprints 1–22)
+- Sprint history: 29 passes (Runs 1–3 autonomous, Sprints 1–26)
 - **Next step: real-project testing**
 
 ---

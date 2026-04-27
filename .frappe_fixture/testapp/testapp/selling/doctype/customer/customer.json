@@ -1,0 +1,12 @@
+{
+  "doctype": "DocType",
+  "name": "Customer",
+  "module": "Selling",
+  "fields": [
+    {"fieldtype": "Data", "fieldname": "customer_name", "label": "Customer Name"},
+    {"fieldtype": "Link", "fieldname": "customer_group", "label": "Customer Group", "options": "Customer Group"},
+    {"fieldtype": "Link", "fieldname": "territory", "label": "Territory", "options": "Territory"}
+  ],
+  "issingle": 0,
+  "is_virtual": 0
+}
