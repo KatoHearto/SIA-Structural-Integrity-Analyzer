@@ -2,6 +2,7 @@
 
 > Deterministic static analysis for polyglot codebases. Identifies your highest-risk code and packages it as context for LLM coding assistants.
 
+[![GitHub](https://img.shields.io/badge/GitHub-KatoHearto%2FSIA--Structural--Integrity--Analyzer-181717?logo=github)](https://github.com/KatoHearto/SIA-Structural-Integrity-Analyzer)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
 ![Languages](https://img.shields.io/badge/Languages-9-green)
 ![Version](https://img.shields.io/badge/Version-3.52-orange)
