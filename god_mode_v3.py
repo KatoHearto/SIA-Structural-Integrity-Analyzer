@@ -745,7 +745,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.59",
+                "version": "3.60",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -5236,7 +5236,7 @@ class StructuralIntegrityAnalyzerV3:
                 re.search(r"\binput\s*\(", text)
                 or re.search(r"@\w*(?:route|get|post|put|delete|patch)\b", lower)
                 or re.search(r"\brequest\.(?:GET|POST|data|body|json|form|files|args)\b", text)
-                or re.search(r"\b(?:Body|Query|Path|Form|Header|Cookie|Depends)\s*\(", text)
+                or re.search(r"\b(?:Body|Query|Form|Header|Cookie|Depends)\s*\(", text)
             ):
                 self._record_semantic_ref(refs, node, "input_boundary", lineno, lineno, "Reads data at an input boundary.")
             if re.search(
