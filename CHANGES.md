@@ -1261,3 +1261,16 @@ wires into `StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` p
   specific JS code needed)
 - Documentation: `CHANGES.md`, `WORKER_GUIDE.md`, `README.md` updated through Sprint 26
 
+## Sprint 27 — New Semantic Signals: `concurrency` + `caching` (v3.57)
+
+- New signal `concurrency` (weight 2.6) — fires on thread/goroutine/coroutine spawning,
+  locks, channels, atomic ops, and executor submission across all 9 languages
+- New signal `caching` (weight 1.8) — fires on Redis/Memcached clients, LRU caches,
+  framework annotations (`@Cacheable`, `Rails.cache`, Laravel `Cache::`) across all 9 languages
+- Both signals added to `SEMANTIC_CRITICAL_SIGNALS`; `concurrency` to
+  `SEMANTIC_SIDE_EFFECT_SIGNALS`, `caching` to `SEMANTIC_EXTERNAL_IO_SIGNALS`
+- Reclassifications: Java/Kotlin `@Cacheable` `state_mutation` → `caching`; Kotlin
+  coroutine builders `process_io` → `concurrency`; PHP `Cache::` / Ruby `Rails.cache.`
+  `state_mutation` → `caching`
+
+

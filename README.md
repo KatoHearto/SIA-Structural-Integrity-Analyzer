@@ -5,7 +5,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-KatoHearto%2FSIA--Structural--Integrity--Analyzer-181717?logo=github)](https://github.com/KatoHearto/SIA-Structural-Integrity-Analyzer)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
 ![Languages](https://img.shields.io/badge/Languages-9-green)
-![Version](https://img.shields.io/badge/Version-3.55-orange)
+![Version](https://img.shields.io/badge/Version-3.57-orange)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 ![Lines](https://img.shields.io/badge/Source-14%2C150%20lines-informational)
 
@@ -80,7 +80,7 @@ python god_mode_v3.py ./my-project --exclude vendor --exclude build
 - **PageRank** — recursive importance in the dependency graph
 - **Betweenness centrality** — how often this node sits on the shortest path between others
 - **Git hotspot score** — change frequency from `git log` (optional, `--no-git-hotspots` to disable)
-- **Semantic signals** — 16 behavioral categories detected per symbol (see below)
+- **Semantic signals** — 18 behavioral categories detected per symbol (see below)
 
 ### Semantic Signals
 
@@ -88,8 +88,8 @@ python god_mode_v3.py ./my-project --exclude vendor --exclude build
 network_io       database_io      filesystem_io    process_io
 config_access    input_boundary   output_boundary  validation_guard
 auth_guard       error_handling   serialization    deserialization
-state_mutation   time_or_randomness
-dynamic_dispatch orm_dynamic_load
+state_mutation   time_or_randomness  dynamic_dispatch  orm_dynamic_load
+concurrency      caching
 ```
 
 Each signal is detected by language-specific pattern matching across all 9 languages.
@@ -235,7 +235,7 @@ Top-ranked method: `_build_ask_context_pack` (score=48.5, Ce=29, instability=0.9
 
 ## Development History
 
-SIA was developed in **29 passes** (3 autonomous runs + 26 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
+SIA was developed in **30 passes** (3 autonomous runs + 27 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
 
 | Sprints | Deliverable |
 |---------|-------------|
@@ -249,6 +249,8 @@ SIA was developed in **29 passes** (3 autonomous runs + 26 directed sprints) usi
 | Sprint 22 | Ruby (9th language), `.siaignore`, `--filter-language` |
 | Sprint 23–24 | Frappe Plugin: DocTypes, Link/Child fields, Controllers |
 | Sprint 25 | Frappe Plugin: ORM resolution + Semantic enrichment |
+| Sprint 26 | Frappe Plugin: JS cross-language, polish, documentation |
+| Sprint 27 | New semantic signals: `concurrency` + `caching` (all 9 languages) |
 
 Full changelog: [`CHANGES.md`](CHANGES.md)  
 Sprint briefings: [`docs/sprints/`](docs/sprints/)

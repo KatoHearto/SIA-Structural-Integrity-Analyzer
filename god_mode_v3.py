@@ -232,6 +232,8 @@ SEMANTIC_SIGNAL_WEIGHTS = {
     "time_or_randomness": 1.2,
     "dynamic_dispatch": 2.0,
     "orm_dynamic_load": 2.5,
+    "concurrency": 2.6,
+    "caching": 1.8,
 }
 SEMANTIC_SIGNAL_ORDER = {
     signal: index
@@ -249,23 +251,26 @@ SEMANTIC_SIDE_EFFECT_SIGNALS = {
     "filesystem_io",
     "process_io",
     "state_mutation",
+    "concurrency",
 }
 SEMANTIC_BOUNDARY_SIGNALS = {"input_boundary", "output_boundary"}
 SEMANTIC_GUARD_SIGNALS = {"validation_guard", "auth_guard", "error_handling"}
-SEMANTIC_EXTERNAL_IO_SIGNALS = {"network_io", "database_io", "filesystem_io", "process_io", "orm_dynamic_load"}
+SEMANTIC_EXTERNAL_IO_SIGNALS = {"network_io", "database_io", "filesystem_io", "process_io", "orm_dynamic_load", "caching"}
 SEMANTIC_CRITICAL_SIGNALS = {
     "auth_guard",
+    "caching",
+    "concurrency",
     "database_io",
+    "dynamic_dispatch",
     "external_io",
     "filesystem_io",
     "input_boundary",
     "network_io",
+    "orm_dynamic_load",
     "output_boundary",
     "process_io",
     "state_mutation",
     "validation_guard",
-    "dynamic_dispatch",
-    "orm_dynamic_load",
 }
 BEHAVIORAL_FLOW_STEP_ORDER = {
     "input_boundary": 0,
@@ -275,7 +280,9 @@ BEHAVIORAL_FLOW_STEP_ORDER = {
     "auth_guard": 4,
     "state_read": 5,
     "state_mutation": 6,
+    "concurrency": 6,
     "orm_dynamic_load": 7,
+    "caching": 7,
     "database_io": 7,
     "network_io": 8,
     "filesystem_io": 9,
@@ -734,7 +741,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.56",
+                "version": "3.57",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -5108,6 +5115,26 @@ class StructuralIntegrityAnalyzerV3:
             if guard is not None:
                 signal, end_line, reason = guard
                 self._record_semantic_ref(refs, node, signal, lineno, end_line, reason)
+            if (
+                re.search(r"\bthreading\.(?:Thread|Lock|RLock|Event|Semaphore|Condition|Barrier)\b", text)
+                or re.search(r"\bconcurrent\.futures\.(?:ThreadPoolExecutor|ProcessPoolExecutor|as_completed|wait)\b", text)
+                or re.search(r"\bmultiprocessing\.(?:Process|Pool|Queue|Pipe|Lock|Manager)\b", text)
+                or re.search(r"\basyncio\.(?:create_task|gather|wait|wait_for|Lock|Semaphore|Queue|Event|Barrier|TaskGroup)\s*[\(\[]", text)
+                or re.search(r"\bqueue\.(?:Queue|SimpleQueue|LifoQueue|PriorityQueue)\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Spawns threads, coroutines, or uses Python concurrency primitives.")
+            if (
+                re.search(r"@(?:functools\.)?(?:lru_cache|cache)\b", text)
+                or re.search(r"\bfunctools\.lru_cache\s*\(", text)
+                or re.search(r"\bredis(?:\.asyncio)?\.(?:Redis|StrictRedis)\s*\(", text)
+                or re.search(r"\bcachetools\.(?:cached|LRUCache|TTLCache|LFUCache|MRUCache|RRCache)\b", text)
+                or re.search(r"\bdiskcache\.Cache\s*\(", text)
+                or re.search(r"\bcache\.(?:get|set|delete|add|incr|decr|get_many|set_many)\s*\(", text)
+                or re.search(r"\bdjango\.core\.cache\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Uses an in-memory or distributed cache.")
 
         if "frappe" in self.active_plugins and node.file.endswith("hooks.py"):
             for index, (lineno, text) in enumerate(source_lines):
@@ -5193,14 +5220,27 @@ class StructuralIntegrityAnalyzerV3:
                 )
             if re.search(r"@(?:Cacheable|CacheEvict|CachePut|Caching)\b", text):
                 self._record_semantic_ref(
-                    refs, node, "state_mutation", lineno, lineno,
-                    "Spring cache annotation reads or mutates a shared cache store.",
+                    refs, node, "caching", lineno, lineno,
+                    "Spring cache annotation reads or writes a shared cache store.",
                 )
             if re.search(r"@Scheduled\b", text):
                 self._record_semantic_ref(
                     refs, node, "time_or_randomness", lineno, lineno,
                     "@Scheduled drives execution by a time-based trigger.",
                 )
+            if (
+                re.search(r"\bnew Thread\s*\(", text)
+                or re.search(r"\bExecutors?\.[A-Za-z_]\w*\s*\(", text)
+                or re.search(r"\bCompletableFuture\.[A-Za-z_]\w*\s*\(", text)
+                or re.search(r"\bForkJoinPool\b", text)
+                or re.search(r"\bCountDownLatch\b|\bCyclicBarrier\b|\bPhaser\b", text)
+                or re.search(r"\bReentrantLock\b|\bReentrantReadWriteLock\b|\bStampedLock\b", text)
+                or re.search(r"\bsynchronized\s*\(", text)
+                or re.search(r"\bAtomicInteger\b|\bAtomicLong\b|\bAtomicReference\b|\bAtomicBoolean\b", text)
+                or re.search(r"\bBlockingQueue\b|\bLinkedBlockingQueue\b|\bArrayBlockingQueue\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Uses Java threading or concurrency primitives.")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
@@ -5278,6 +5318,26 @@ class StructuralIntegrityAnalyzerV3:
                 )
             ):
                 self._record_semantic_ref(refs, node, "validation_guard", lineno, lineno, "Invokes schema validation (Zod/Joi/Yup).")
+            if (
+                re.search(r"\bnew Worker\s*\(", text)
+                or re.search(r"\bSharedArrayBuffer\b", text)
+                or re.search(r"\bAtomics\.", text)
+                or re.search(r"\bPromise\.(?:all|race|allSettled|any)\s*\(", text)
+                or re.search(r"\bworker_threads\b", text)
+                or re.search(r"\bcluster\.fork\s*\(", text)
+                or re.search(r"\bnew (?:MessageChannel|BroadcastChannel)\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Uses workers, parallel Promise composition, or shared-memory primitives.")
+            if (
+                re.search(r"\blru[-_]cache\b|\bLRUCache\s*\(|\bnew LRU\s*\(", text, re.IGNORECASE)
+                or re.search(r"\bnew NodeCache\s*\(", text)
+                or re.search(r"\bunstable_cache\s*\(", text)
+                or re.search(r"\buseMemo\s*\(|\buseCallback\s*\(|\bReact\.memo\s*\(", text)
+                or re.search(r"\bredis\.(?:get|set|setex|getset|mget|mset|del|expire|exists)\s*\(", lower)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Uses a cache (LRU, Redis client, React memo, or Next.js unstable_cache).")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
@@ -5359,6 +5419,26 @@ class StructuralIntegrityAnalyzerV3:
                 self._record_semantic_ref(refs, node, "deserialization", lineno, lineno, "Deserializes structured data in Go.")
             if re.search(r"\b[a-z]\w*\.[A-Za-z_]\w*\s*=(?!=)", text):
                 self._record_semantic_ref(refs, node, "state_mutation", lineno, lineno, "Mutates a struct field in Go.")
+            if (
+                re.search(r"\bgo\s+[A-Za-z_]", text)
+                or re.search(r"\bmake\s*\(\s*chan\b", text)
+                or re.search(r"\bsync\.(?:Mutex|RWMutex|WaitGroup|Once|Map|Cond)\b", text)
+                or re.search(r"\batomic\.(?:Add|Load|Store|Swap|CompareAndSwap)\b", text)
+                or re.search(r"\bsync/atomic\b", text)
+                or re.search(r"\bselect\s*\{", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Spawns a goroutine or uses Go concurrency primitives.")
+            if (
+                re.search(r"\bbigcache\.New(?:BigCache)?\s*\(", text)
+                or re.search(r"\bfreecache\.NewCache\s*\(", text)
+                or re.search(r"\bristretto\.NewCache\s*\(", text)
+                or re.search(r"\bgocache\.New\s*\(", text)
+                or re.search(r"\bgroupcache\.NewGroup\s*\(", text)
+                or re.search(r"\bsync\.Pool\s*\{", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Uses a Go in-process or distributed cache.")
         return refs
 
     def _extract_rust_semantic_spans(
@@ -5439,6 +5519,29 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"\bvalidator::validate_\w+\s*\(", text)
             ):
                 self._record_semantic_ref(refs, node, "validation_guard", lineno, lineno, "Invokes Rust struct/field validation (validator/garde crate).")
+            if (
+                re.search(r"\bthread::spawn\s*\(", text)
+                or re.search(r"\bArc::new\s*\(", text)
+                or re.search(r"\bMutex::new\s*\(|\bRwLock::new\s*\(", text)
+                or re.search(r"\bmpsc::(?:channel|sync_channel)\s*\(", text)
+                or re.search(r"\btokio::spawn\s*\(", text)
+                or re.search(r"\bsmol::spawn\s*\(|\basync_std::task::spawn\s*\(", text)
+                or re.search(r"\brayon::(?:spawn|scope|join)\s*\(", text)
+                or re.search(r"\bcrossbeam(?:_channel)?::\b", text)
+                or re.search(r"\bAtomicUsize\b|\bAtomicBool\b|\bAtomicI32\b|\bAtomicU64\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Spawns threads or uses Rust concurrency primitives.")
+            if (
+                re.search(r"\bmoka::(?:Cache|future::Cache)\b", text)
+                or re.search(r"#\[cached\]", text)
+                or re.search(r"\bonce_cell::sync::", text)
+                or re.search(r"\blazy_static!\b", text)
+                or re.search(r"\bstd::sync::(?:OnceLock|LazyLock)\b", text)
+                or re.search(r"\blru::LruCache\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Uses a Rust cache crate or lazy-initialised global.")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
@@ -5520,6 +5623,28 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"\bContentResult\b|\bJsonResult\b|\bObjectResult\b", text)
             ):
                 self._record_semantic_ref(refs, node, "output_boundary", lineno, lineno, "ASP.NET Core action returns a boundary-facing response.")
+            if (
+                re.search(r"\bnew Thread\s*\(", text)
+                or re.search(r"\bTask\.(?:Run|Factory\.StartNew|WhenAll|WhenAny|Delay)\s*\(", text)
+                or re.search(r"\bParallel\.(?:For|ForEach|Invoke)\s*\(", text)
+                or re.search(r"\bCancellationToken(?:Source)?\b", text)
+                or re.search(r"\bSemaphoreSlim\b|\bMutex\b", text)
+                or re.search(r"\bMonitor\.(?:Enter|Exit|Wait|Pulse)\b", text)
+                or re.search(r"\bChannel\.Create(?:Unbounded|Bounded)\s*\(", text)
+                or re.search(r"\bThreadPool\.QueueUserWorkItem\s*\(", text)
+                or re.search(r"\bInterlocked\.(?:Add|Increment|Decrement|Exchange|CompareExchange)\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Uses C# threading or async concurrency primitives.")
+            if (
+                re.search(r"\bIMemoryCache\b|\bIDistributedCache\b", text)
+                or re.search(r"\bcache\.(?:Get|Set|TryGetValue|GetOrCreate|GetOrCreateAsync|Remove)\s*\(", text)
+                or re.search(r"\bMemoryCache\b|\bDistributedCache\b", text)
+                or re.search(r"\[ResponseCache\b", text)
+                or re.search(r"\bOutputCache(?:Attribute)?\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Uses ASP.NET Core memory or distributed caching.")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
@@ -5577,12 +5702,19 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"\bnew FileInputStream\b|\bnew FileOutputStream\b", text)
             ):
                 self._record_semantic_ref(refs, node, "filesystem_io", lineno, lineno, "File system access in Kotlin code.")
-            if re.search(
-                r"\b(?:launch|async|runBlocking|withContext|GlobalScope\.launch|"
-                r"CoroutineScope|supervisorScope|coroutineScope)\s*[{\(]",
-                text,
+            if (
+                re.search(
+                    r"\b(?:launch|async|runBlocking|withContext|GlobalScope\.launch|"
+                    r"CoroutineScope|supervisorScope|coroutineScope)\s*[{\(]",
+                    text,
+                )
+                or re.search(r"\bMutex\(\)|\bSemaphore\(\)", text)
+                or re.search(r"\bChannel<", text)
+                or re.search(r"\bnew Thread\s*\(|\bExecutors?\.[A-Za-z_]\w*\s*\(", text)
+                or re.search(r"\bStateFlow\b|\bSharedFlow\b|\bMutableStateFlow\b", text)
             ):
-                self._record_semantic_ref(refs, node, "process_io", lineno, lineno, "Coroutine builder creates a concurrent execution context.")
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Coroutine builder or concurrency primitive creates a concurrent execution context.")
             if (
                 re.search(r"@(?:Value|ConfigurationProperties)\b", text)
                 or re.search(r"\bSystem\.getenv\s*\(", text)
@@ -5610,8 +5742,13 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"@Scheduled\b", text)
             ):
                 self._record_semantic_ref(refs, node, "time_or_randomness", lineno, lineno, "Uses time or randomness sources.")
-            if re.search(r"@(?:Cacheable|CacheEvict|CachePut|Caching)\b", text):
-                self._record_semantic_ref(refs, node, "state_mutation", lineno, lineno, "Spring cache annotation mutates a shared cache store.")
+            if (
+                re.search(r"@(?:Cacheable|CacheEvict|CachePut|Caching)\b", text)
+                or re.search(r"\bCaffeineCache\b|\bEhcache\b", text)
+                or re.search(r"\bcache\.(?:get|put|evict|putIfAbsent)\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Spring cache annotation or cache API reads or writes a shared cache store.")
             if (
                 re.search(r"\b(?:try|catch|throw)\b", text)
                 or re.search(r"\brun[Cc]atching\s*\{", text)
@@ -5711,13 +5848,17 @@ class StructuralIntegrityAnalyzerV3:
             ):
                 self._record_semantic_ref(refs, node, "time_or_randomness", lineno, lineno,
                                           "Uses time or randomness sources.")
-            if (
-                re.search(r"\$_SESSION\b", text)
-                or re.search(r"\bCache::(?:put|forget|forever|remember)\s*\(", text)
-                or re.search(r"\bcache\s*\(\s*\)->(?:put|forget|remember)\s*\(", text)
-            ):
+            if re.search(r"\$_SESSION\b", text):
                 self._record_semantic_ref(refs, node, "state_mutation", lineno, lineno,
-                                          "Mutates session or cache state.")
+                                          "Mutates PHP session state.")
+            if (
+                re.search(r"\bCache::(?:get|put|forget|forever|remember|has|pull|flush|tags)\s*\(", text)
+                or re.search(r"\bcache\s*\(\s*\)->(?:get|put|forget|remember)\s*\(", text)
+                or re.search(r"\bRedis::(?:get|set|setex|expire|del)\s*\(", text)
+                or re.search(r"\bnew Memcached\s*\(|\$memcache->(?:get|set|delete)\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Reads or writes a Laravel/Redis/Memcached cache.")
             if re.search(r"\b(?:try|catch|throw)\b", text):
                 self._record_semantic_ref(refs, node, "error_handling", lineno, lineno,
                                           "Contains explicit PHP error handling.")
@@ -5729,6 +5870,15 @@ class StructuralIntegrityAnalyzerV3:
             ):
                 self._record_semantic_ref(refs, node, "output_boundary", lineno, lineno,
                                           "Produces observable output (echo, response).")
+            if (
+                re.search(r"\\parallel\\(?:Runtime|Channel|Future)\b", text)
+                or re.search(r"\bpcntl_fork\s*\(", text)
+                or re.search(r"\bQueue::(?:push|bulk|later)\s*\(", text)
+                or re.search(r"\bdispatch(?:Now)?\s*\(\s*new\s+", text)
+                or re.search(r"\bReact\\EventLoop\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Dispatches async jobs or uses PHP concurrency extension.")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
@@ -5831,12 +5981,17 @@ class StructuralIntegrityAnalyzerV3:
             ):
                 self._record_semantic_ref(refs, node, "time_or_randomness", lineno, lineno,
                                           "Uses time or randomness sources.")
-            if (
-                re.search(r"\bRails\.cache\.(?:write|fetch|delete)\s*\(", text)
-                or re.search(r"\bsession\s*\[", text)
-            ):
+            if re.search(r"\bsession\s*\[", text):
                 self._record_semantic_ref(refs, node, "state_mutation", lineno, lineno,
-                                          "Mutates Rails cache or session state.")
+                                          "Mutates Rails session state.")
+            if (
+                re.search(r"\bRails\.cache\.(?:write|fetch|delete|read|exist\?|clear)\s*\(", text)
+                or re.search(r"\bRedis\.new\b|\bRedis::Client\b", text)
+                or re.search(r"\bDalli::Client\b", text)
+                or re.search(r"\bmemoize\s*\(", text)
+            ):
+                self._record_semantic_ref(refs, node, "caching", lineno, lineno,
+                                          "Reads or writes a Rails/Redis/Memcached cache.")
             if re.search(r"\brescue\b|\braise\b", text):
                 self._record_semantic_ref(refs, node, "error_handling", lineno, lineno,
                                           "Contains explicit Ruby error handling.")
@@ -5848,6 +6003,16 @@ class StructuralIntegrityAnalyzerV3:
             ):
                 self._record_semantic_ref(refs, node, "output_boundary", lineno, lineno,
                                           "Produces observable output (render, log, puts).")
+            if (
+                re.search(r"\bThread\.(?:new|start)\s*[\{\(]", text)
+                or re.search(r"\bMutex\.new\b|\.synchronize\s*\{", text)
+                or re.search(r"\bQueue\.new\b", text)
+                or re.search(r"\bConcurrent::(?:Future|Promise|IVar|Actor|ThreadPoolExecutor)\b", text)
+                or re.search(r"\bperform_async\s*\(|\bperform_later\s*\(", text)
+                or re.search(r"\bSidekiq::Worker\b|\bResque::Job\b", text)
+            ):
+                self._record_semantic_ref(refs, node, "concurrency", lineno, lineno,
+                                          "Spawns threads or delegates work to a background-job framework.")
             guard = self._guard_signal_for_window(source_lines, index)
             if guard is not None:
                 signal, end_line, reason = guard
