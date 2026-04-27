@@ -5,7 +5,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-KatoHearto%2FSIA--Structural--Integrity--Analyzer-181717?logo=github)](https://github.com/KatoHearto/SIA-Structural-Integrity-Analyzer)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
 ![Languages](https://img.shields.io/badge/Languages-9-green)
-![Version](https://img.shields.io/badge/Version-3.58-orange)
+![Version](https://img.shields.io/badge/Version-3.59-orange)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 ![Lines](https://img.shields.io/badge/Source-14%2C150%20lines-informational)
 
@@ -235,7 +235,7 @@ Top-ranked method: `_build_ask_context_pack` (score=48.5, Ce=29, instability=0.9
 
 ## Development History
 
-SIA was developed in **31 passes** (3 autonomous runs + 28 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
+SIA was developed in **32 passes** (3 autonomous runs + 29 directed sprints) using an AI-assisted workflow where Claude acted as both architect and implementation worker.
 
 | Sprints | Deliverable |
 |---------|-------------|
@@ -252,6 +252,7 @@ SIA was developed in **31 passes** (3 autonomous runs + 28 directed sprints) usi
 | Sprint 26 | Frappe Plugin: JS cross-language, polish, documentation |
 | Sprint 27 | New semantic signals: `concurrency` + `caching` (all 9 languages) |
 | Sprint 28 | Guard propagation: `reachable_guards` from callers (depth ≤ 2) |
+| Sprint 29 | Architectural warnings: 8 combination-rule anti-patterns |
 
 Full changelog: [`CHANGES.md`](CHANGES.md)  
 Sprint briefings: [`docs/sprints/`](docs/sprints/)

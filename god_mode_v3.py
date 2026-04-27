@@ -453,6 +453,7 @@ class SymbolNode:
     resolved_string_refs: Set[str] = field(default_factory=set)
     plugin_data: Dict[str, object] = field(default_factory=dict)
     reachable_guards: Set[str] = field(default_factory=set)
+    architectural_warnings: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -728,6 +729,7 @@ class StructuralIntegrityAnalyzerV3:
         self._compute_coords()
         self._extract_semantic_signals()
         self._propagate_guard_signals()
+        self._compute_architectural_warnings()
         self._compute_risk_scores()
         self._extract_behavioral_flows()
 
@@ -743,7 +745,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.58",
+                "version": "3.59",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -752,6 +754,9 @@ class StructuralIntegrityAnalyzerV3:
                 "git_hotspots_enabled": self.git_hotspot_enabled,
                 "git_tracked_file_count": self.git_tracked_file_count,
                 "parse_error_count": len(self.parse_errors),
+                "architectural_warning_count": sum(
+                    len(n.architectural_warnings) for n in self.nodes.values()
+                ),
                 "ask_query_present": bool(ask_context_pack),
             },
             "top_risks": top_risks,
@@ -762,6 +767,17 @@ class StructuralIntegrityAnalyzerV3:
             "recursive_symbols": recursive_symbols,
             "llm_context_pack": llm_context_pack,
             "parse_errors": self.parse_errors,
+            "architectural_warnings": [
+                {
+                    "node_id": node.node_id,
+                    "language": node.language,
+                    "kind": node.kind,
+                    "file": node.file,
+                    "warnings": list(node.architectural_warnings),
+                }
+                for node in sorted(self.nodes.values(), key=lambda n: n.node_id)
+                if node.architectural_warnings
+            ],
         }
         if ask_context_pack is not None:
             report["ask_context_pack"] = ask_context_pack
@@ -5059,6 +5075,103 @@ class StructuralIntegrityAnalyzerV3:
                             if s in SEMANTIC_GUARD_SIGNALS
                         )
 
+    def _evaluate_arch_rules(self, node: "SymbolNode") -> List[Dict[str, object]]:
+        """Return architectural-warning dicts for every anti-pattern rule that fires."""
+        if not node.semantic_signals:
+            return []
+        warnings: List[Dict[str, object]] = []
+        own: Set[str] = set(node.semantic_signals)
+        reach: Set[str] = node.reachable_guards
+        all_guards: Set[str] = own | reach
+
+        if "input_boundary" in own:
+            if "auth_guard" not in all_guards and "validation_guard" not in all_guards:
+                warnings.append({
+                    "rule": "unguarded_entry",
+                    "severity": "critical",
+                    "message": (
+                        "Accepts external input without authentication or validation guard "
+                        "anywhere in the 2-level call chain."
+                    ),
+                })
+
+        if "deserialization" in own and "validation_guard" not in all_guards:
+            warnings.append({
+                "rule": "untrusted_deserialization",
+                "severity": "critical",
+                "message": (
+                    "Deserializes external data without a validation guard - "
+                    "classic injection or RCE risk."
+                ),
+            })
+
+        if "concurrency" in own and "state_mutation" in own and "error_handling" not in own:
+            warnings.append({
+                "rule": "concurrent_mutation",
+                "severity": "high",
+                "message": (
+                    "Concurrent execution combined with mutable state and no error handling - "
+                    "race condition or deadlock risk."
+                ),
+            })
+
+        if "caching" in own and "state_mutation" in own and "concurrency" in own:
+            warnings.append({
+                "rule": "cache_coherence_risk",
+                "severity": "high",
+                "message": (
+                    "Cache writes combined with concurrent state mutation - "
+                    "stale reads or write-after-write conflicts possible."
+                ),
+            })
+
+        if "network_io" in own and "error_handling" not in own and "error_handling" not in reach:
+            warnings.append({
+                "rule": "open_network_call",
+                "severity": "high",
+                "message": (
+                    "Outbound network call with no error handling in this symbol or its callers - "
+                    "failures propagate silently."
+                ),
+            })
+
+        if "database_io" in own and "state_mutation" in own and "auth_guard" not in all_guards:
+            warnings.append({
+                "rule": "unguarded_db_write",
+                "severity": "high",
+                "message": (
+                    "Writes to the database without an authentication guard "
+                    "in this symbol or its callers."
+                ),
+            })
+
+        if "orm_dynamic_load" in own and "dynamic_dispatch" in own:
+            warnings.append({
+                "rule": "double_indirection",
+                "severity": "medium",
+                "message": (
+                    "Dynamic ORM load combined with string-based dispatch - "
+                    "two layers of runtime indirection make this symbol hard to trace statically."
+                ),
+            })
+
+        if "input_boundary" in own and "state_mutation" in own and "validation_guard" not in own:
+            warnings.append({
+                "rule": "stateful_input_boundary",
+                "severity": "medium",
+                "message": (
+                    "Mutates state from an external input boundary without first validating "
+                    "the input - save-before-validate pattern."
+                ),
+            })
+
+        return warnings
+
+    def _compute_architectural_warnings(self) -> None:
+        """Populate architectural_warnings on every node by evaluating all anti-pattern rules."""
+        for node in self.nodes.values():
+            node.architectural_warnings = self._evaluate_arch_rules(node)
+
     def _extract_python_semantic_spans(
         self,
         node: SymbolNode,
@@ -5098,8 +5211,13 @@ class StructuralIntegrityAnalyzerV3:
                 or re.search(r"\b(?:conn|connection)\.(?:fetch|fetchrow|fetchval|execute)\s*\(", text)
             ):
                 self._record_semantic_ref(refs, node, "database_io", lineno, lineno, "Touches a database or session API.")
-            if _FRAPPE_ORM_LOAD_RE.search(text) or _FRAPPE_DB_RE.search(text):
+            frappe_db_match = _FRAPPE_DB_RE.search(text)
+            if _FRAPPE_ORM_LOAD_RE.search(text) or frappe_db_match:
                 self._record_semantic_ref(refs, node, "orm_dynamic_load", lineno, lineno, "Invokes Frappe ORM dynamic load.")
+            if frappe_db_match:
+                self._record_semantic_ref(refs, node, "database_io", lineno, lineno, "Touches a Frappe database API.")
+            if re.search(r"\bfrappe\.db\.(?:set_value|delete)\s*\(", text):
+                self._record_semantic_ref(refs, node, "state_mutation", lineno, lineno, "Mutates database state via Frappe DB API.")
             if re.search(r"\bos\.(?:environ|getenv)\b", text) or re.search(r"\b(?:configparser|dotenv)\b", text) or re.search(r"\btomllib\.(?:load|loads)\s*\(", text):
                 self._record_semantic_ref(refs, node, "config_access", lineno, lineno, "Reads configuration or environment state.")
             if re.search(r"\b(?:json|pickle|yaml)\.(?:dump|dumps|safe_dump)\s*\(", text):
@@ -6267,6 +6385,7 @@ class StructuralIntegrityAnalyzerV3:
             "reasons": node.reasons,
             "semantic_signals": list(node.semantic_signals),
             **({"reachable_guards": sorted(node.reachable_guards)} if node.reachable_guards else {}),
+            **({"architectural_warnings": list(node.architectural_warnings)} if node.architectural_warnings else {}),
             "resolved_string_refs": sorted(node.resolved_string_refs),
             **({"plugin_data": dict(node.plugin_data)} if node.plugin_data else {}),
             "semantic_evidence_spans": list(node.semantic_evidence_spans),
@@ -6328,6 +6447,7 @@ class StructuralIntegrityAnalyzerV3:
                     "reasons": node.reasons,
                     "semantic_signals": list(node.semantic_signals),
                     **({"reachable_guards": sorted(node.reachable_guards)} if node.reachable_guards else {}),
+                    **({"architectural_warnings": list(node.architectural_warnings)} if node.architectural_warnings else {}),
                     "semantic_summary": dict(node.semantic_summary),
                     "semantic_weight": node.semantic_weight,
                     "contained_semantic_signals": list(node.contained_semantic_signals),
@@ -13907,6 +14027,34 @@ def _build_markdown_report(report: Dict[str, object]) -> str:
             lines.append(f"| {name} | {links} | {children} | `{ctrl}` | {orm_refs} |")
         lines.append("")
 
+    arch_warnings: List[Dict[str, object]] = report.get("architectural_warnings", [])
+    if arch_warnings:
+        total = sum(len(entry.get("warnings", [])) for entry in arch_warnings)
+        lines.append("\n## Architectural Warnings\n")
+        lines.append(
+            f"**{total} warning{'s' if total != 1 else ''} across "
+            f"{len(arch_warnings)} symbol{'s' if len(arch_warnings) != 1 else ''}.**\n"
+        )
+        lines.append("| Severity | Symbol | Rule | Message |")
+        lines.append("|----------|--------|------|---------|")
+        _sev_order = {"critical": 0, "high": 1, "medium": 2}
+        rows = []
+        for entry in arch_warnings:
+            sym = str(entry.get("node_id", ""))
+            for w in entry.get("warnings", []):
+                sev = str(w.get("severity", "medium"))
+                rows.append((
+                    _sev_order.get(sev, 99),
+                    sym,
+                    sev,
+                    str(w.get("rule", "")),
+                    str(w.get("message", "")),
+                ))
+        rows.sort()
+        for _, sym, sev, rule, msg in rows:
+            lines.append(f"| **{sev}** | `{sym}` | `{rule}` | {msg} |")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -14074,6 +14222,22 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
     else:
         print()
         print("Dependency cycles: none")
+
+    arch_warnings_for_symbol: List[Dict[str, object]] = []
+    for aw in report.get("architectural_warnings", []):
+        if str(aw.get("node_id", "")) == symbol:
+            arch_warnings_for_symbol = list(aw.get("warnings", []))
+            break
+    if not arch_warnings_for_symbol and detail_entry:
+        arch_warnings_for_symbol = list(detail_entry.get("architectural_warnings", []))
+    if arch_warnings_for_symbol:
+        print()
+        print(f"Architectural Warnings ({len(arch_warnings_for_symbol)}):")
+        for w in arch_warnings_for_symbol:
+            sev = str(w.get("severity", "?")).upper()
+            rule = str(w.get("rule", ""))
+            msg = str(w.get("message", ""))
+            print(f"  [{sev}] {rule}: {msg}")
 
     print(sep)
 

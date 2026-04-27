@@ -1281,3 +1281,17 @@ wires into `StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` p
 - Called between `_extract_semantic_signals()` and `_compute_risk_scores()` in the main loop
 - Surfaces in JSON output (`reachable_guards` key, omitted when empty) and `--why` display
 - Foundation for Sprint 29 architectural combination-rule warnings
+
+## Sprint 29 — Architectural Warnings: Combination-Rule Engine (v3.59)
+
+- New `architectural_warnings: List[Dict]` field on `SymbolNode`
+- `_evaluate_arch_rules()`: evaluates 8 anti-pattern rules using own signals + `reachable_guards`
+- `_compute_architectural_warnings()`: iterates all nodes, called between guard propagation
+  and risk scoring
+- 8 rules: `unguarded_entry`, `untrusted_deserialization` (critical); `concurrent_mutation`,
+  `cache_coherence_risk`, `open_network_call`, `unguarded_db_write` (high);
+  `double_indirection`, `stateful_input_boundary` (medium)
+- `"architectural_warnings"` top-level key in JSON report and per-node in `nodes[]`
+- `meta.architectural_warning_count` added
+- Markdown report: Architectural Warnings table (severity-sorted)
+- `--why`: shows warnings for the queried symbol
