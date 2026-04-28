@@ -1,3 +1,4 @@
+# ── SIA src/00_header.py ── (god_mode_v3.py lines 1–401) ────────────────────
 #!/usr/bin/env python3
 """
 Structural Integrity Analyzer (Zero-Voodoo v3)
@@ -214,6 +215,18 @@ WORKER_TERMINAL_STATES: Set[str] = {
     "invalid_result",
 }
 
+_TAINT_SOURCE_KINDS = {
+    "http_param": ["frappe.form_dict", "frappe.request.json", "frappe.local.form_dict"],
+    "cli_arg": ["sys.argv", "argparse", "click.argument", "click.option"],
+    "event_hook": ["doc.as_dict()", "frappe.get_doc"],
+    "file_read": ["open(", "json.load", "yaml.safe_load", "toml.load"],
+    "env_var": ["os.environ", "os.getenv"],
+    "external_api": ["requests.get", "requests.post", "httpx.get", "httpx.post"],
+}
+_TAINT_SOURCE_ORDER = {
+    kind: index for index, kind in enumerate(_TAINT_SOURCE_KINDS)
+}
+
 SEMANTIC_SIGNAL_WEIGHTS = {
     "state_mutation": 2.4,
     "external_io": 2.2,
@@ -387,6 +400,8 @@ QUERY_SIGNAL_KEYWORDS = {
 }
 
 
+# ── SIA src/01_core_classes.py ── (god_mode_v3.py lines 402–691) ─────────────
+
 @dataclass
 class SymbolNode:
     node_id: str
@@ -451,9 +466,15 @@ class SymbolNode:
     behavioral_flow_summary: Dict[str, object] = field(default_factory=dict)
     raw_string_refs: Set[str] = field(default_factory=set)
     resolved_string_refs: Set[str] = field(default_factory=set)
+    callable_params: List[str] = field(default_factory=list)
+    callable_decorators: List[str] = field(default_factory=list)
+    exported: bool = False
     plugin_data: Dict[str, object] = field(default_factory=dict)
     reachable_guards: Set[str] = field(default_factory=set)
     architectural_warnings: List[Dict[str, object]] = field(default_factory=list)
+    taint_entry: bool = False
+    taint_sources: List[str] = field(default_factory=list)
+    tainted_params: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -671,6 +692,8 @@ class StringRefCollector(ast.NodeVisitor):
         return
 
 
+# ── SIA src/02_analyzer_init.py ── (god_mode_v3.py lines 692–730) ────────────
+
 class StructuralIntegrityAnalyzerV3:
     def __init__(
         self,
@@ -707,6 +730,10 @@ class StructuralIntegrityAnalyzerV3:
         self.frappe_doctype_snake_to_node: Dict[str, str] = {}
         self.go_root_module: str = self._discover_go_root_module()
         self.js_resolver_configs: List[Dict[str, object]] = self._discover_js_resolver_configs()
+        self.taint_enabled: bool = False
+        self.taint_summary: Dict[str, object] = {}
+
+# ── SIA src/03_run_scan.py ── (god_mode_v3.py lines 731–950) ─────────────────
 
     def run(
         self,
@@ -716,7 +743,10 @@ class StructuralIntegrityAnalyzerV3:
         include_git_hotspots: bool = True,
         ask_query: str = "",
         ask_line_budget: int = 110,
+        enable_taint: bool = False,
     ) -> Dict[str, object]:
+        self.taint_enabled = enable_taint
+        self.taint_summary = {}
         self._scan_files()
         self._build_indices()
         self._resolve_edges()
@@ -732,6 +762,8 @@ class StructuralIntegrityAnalyzerV3:
         self._compute_architectural_warnings()
         self._compute_risk_scores()
         self._extract_behavioral_flows()
+        if enable_taint:
+            self.taint_summary = self._compute_taint_metadata()
 
         top_risks = self._top_risks(top_n)
         modules = self._module_report()
@@ -745,7 +777,7 @@ class StructuralIntegrityAnalyzerV3:
 
         report: Dict[str, object] = {
             "meta": {
-                "version": "3.60",
+                "version": "3.62",
                 "root_dir": self.root_dir,
                 "node_count": len(self.nodes),
                 "edge_count": sum(len(v) for v in self.adj.values()),
@@ -758,6 +790,7 @@ class StructuralIntegrityAnalyzerV3:
                     len(n.architectural_warnings) for n in self.nodes.values()
                 ),
                 "ask_query_present": bool(ask_context_pack),
+                **({"taint_summary": dict(self.taint_summary)} if enable_taint else {}),
             },
             "top_risks": top_risks,
             "module_report": modules,
@@ -922,6 +955,8 @@ class StructuralIntegrityAnalyzerV3:
                     pass
         return False
 
+# ── SIA src/04_frappe_scanner.py ── (god_mode_v3.py lines 951–1079) ──────────
+
     def _scan_frappe_json_files(self) -> None:
         """Walk the project and register all Frappe DocType JSON files as graph nodes."""
         import fnmatch as _fnmatch
@@ -938,9 +973,9 @@ class StructuralIntegrityAnalyzerV3:
                 try:
                     with open(full_path, encoding="utf-8") as handle:
                         data = json.load(handle)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if not isinstance(data, dict):
+                    if not isinstance(data, dict):
+                        raise ValueError("not a JSON object")
+                except (OSError, json.JSONDecodeError, ValueError):
                     continue
                 if data.get("doctype") != "DocType":
                     continue
@@ -1051,6 +1086,8 @@ class StructuralIntegrityAnalyzerV3:
                 return nested
         return candidate if os.path.exists(candidate) else ""
 
+# ── SIA src/05_parser_dispatch.py ── (god_mode_v3.py lines 1080–1395) ────────
+
     def _parse_file(self, rel_path: str) -> None:
         full_path = os.path.join(self.root_dir, rel_path)
         try:
@@ -1145,6 +1182,33 @@ class StructuralIntegrityAnalyzerV3:
         merged_symbols.update(local_symbols)
         return merged_modules, merged_symbols
 
+    @staticmethod
+    def _python_decorator_names(decorators: Iterable[ast.expr]) -> List[str]:
+        names: List[str] = []
+        seen: Set[str] = set()
+        for decorator in decorators:
+            name = ref_name(decorator.func) if isinstance(decorator, ast.Call) else ref_name(decorator)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
+
+    @staticmethod
+    def _python_param_names(args: ast.arguments) -> List[str]:
+        names: List[str] = []
+        for arg in getattr(args, "posonlyargs", []):
+            names.append(arg.arg)
+        for arg in args.args:
+            names.append(arg.arg)
+        if args.vararg is not None:
+            names.append(args.vararg.arg)
+        for arg in args.kwonlyargs:
+            names.append(arg.arg)
+        if args.kwarg is not None:
+            names.append(args.kwarg.arg)
+        return names
+
     def _collect_definitions(
         self,
         module: str,
@@ -1229,7 +1293,19 @@ class StructuralIntegrityAnalyzerV3:
                     imports_symbols=fn_imports_symbols,
                     raw_calls=fn_calls,
                     raw_string_refs=fn_string_refs,
+                    callable_params=self._python_param_names(stmt.args),
+                    callable_decorators=self._python_decorator_names(stmt.decorator_list),
                 )
+                if self.taint_enabled:
+                    self._collect_definitions(
+                        module=module,
+                        rel_path=rel_path,
+                        statements=stmt.body,
+                        imports_modules=fn_imports_modules,
+                        imports_symbols=fn_imports_symbols,
+                        qual_prefix=fn_qual,
+                        class_context=class_context,
+                    )
 
     def _parse_non_python_file(self, rel_path: str, language: str) -> None:
         content = self._read_project_text(rel_path)
@@ -1302,6 +1378,9 @@ class StructuralIntegrityAnalyzerV3:
             raw_calls=set(payload.get("raw_calls", set())),
             raw_bases=set(payload.get("raw_bases", set())),
             raw_string_refs=set(payload.get("raw_string_refs", set())),
+            callable_params=list(payload.get("callable_params", [])),
+            callable_decorators=list(payload.get("callable_decorators", [])),
+            exported=bool(payload.get("exported", False)),
         )
         return node_id
 
@@ -1324,6 +1403,9 @@ class StructuralIntegrityAnalyzerV3:
             file_imports_symbols,
         ):
             self._register_non_python_node(rel_path, content, language, symbol_payload)
+
+# ── SIA src/10_parser_other.py ── (god_mode_v3.py lines 1396–1455) ───────────
+# Java, C#, Kotlin, PHP, Ruby file-level dispatch stubs
 
     def _parse_java_file(self, rel_path: str, content: str, language: str) -> None:
         module_payload = self._parse_java_module(rel_path, content, language)
@@ -1384,6 +1466,8 @@ class StructuralIntegrityAnalyzerV3:
             rel_path, content, module_name, package_name, file_imports_symbols,
         ):
             self._register_non_python_node(rel_path, content, language, symbol_payload)
+
+# ── SIA src/06_parser_js.py ── (god_mode_v3.py lines 1456–2024) ──────────────
 
     def _parse_js_like_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
         function_names = re.findall(r"(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(", content)
@@ -1507,11 +1591,15 @@ class StructuralIntegrityAnalyzerV3:
                 )
             )
 
-        function_pattern = re.compile(r"(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")
+        function_pattern = re.compile(
+            r"(?m)^\s*(export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"
+        )
         for match in function_pattern.finditer(content):
             if depth_map[match.start()] != 0:
                 continue
-            name = match.group(1)
+            exported = bool(match.group(1))
+            name = match.group(2)
+            params = self._extract_js_callable_params(match.group(3))
             open_brace = content.find("{", match.end())
             if open_brace < 0:
                 continue
@@ -1532,17 +1620,21 @@ class StructuralIntegrityAnalyzerV3:
                     "raw_calls": raw_calls,
                     "raw_bases": set(),
                     "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
+                    "callable_params": params,
+                    "exported": exported,
                     "lines": self._span_to_lines(content, match.start(), close_brace),
                 }
             )
 
         arrow_pattern = re.compile(
-            r"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"
+            r"(?m)^\s*(export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(([^)]*)\)|([A-Za-z_$][\w$]*))\s*=>"
         )
         for match in arrow_pattern.finditer(content):
             if depth_map[match.start()] != 0:
                 continue
-            name = match.group(1)
+            exported = bool(match.group(1))
+            name = match.group(2)
+            params = self._extract_js_callable_params(match.group(3) or match.group(4) or "")
             idx = match.end()
             while idx < len(content) and content[idx].isspace():
                 idx += 1
@@ -1570,6 +1662,8 @@ class StructuralIntegrityAnalyzerV3:
                     "raw_calls": raw_calls,
                     "raw_bases": set(),
                     "raw_string_refs": self._harvest_string_refs(body, exclude=raw_calls | raw_imports),
+                    "callable_params": params,
+                    "exported": exported,
                     "lines": self._span_to_lines(content, match.start(), end_index),
                 }
             )
@@ -1862,6 +1956,20 @@ class StructuralIntegrityAnalyzerV3:
         end_line = text.count("\n", 0, end_index + 1) + 1
         return [start_line, end_line]
 
+    def _extract_js_callable_params(self, raw_params: str) -> List[str]:
+        params: List[str] = []
+        for part in raw_params.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            token = token.split("=", 1)[0].strip()
+            if token.startswith("..."):
+                token = token[3:].strip()
+            token = token.split(":", 1)[0].strip().rstrip("?")
+            if re.match(r"^[A-Za-z_$][\w$]*$", token):
+                params.append(token)
+        return self._dedupe(params)
+
     def _extract_js_like_top_level_calls(self, fragment: str) -> Set[str]:
         depth_map = self._compute_js_like_brace_depths(fragment)
         filtered = "".join(char if depth_map[index] == 0 else " " for index, char in enumerate(fragment))
@@ -1930,39 +2038,44 @@ class StructuralIntegrityAnalyzerV3:
             else:
                 imports_symbols[item] = f"{spec}#{item}"
 
+# ── SIA src/07_parser_go.py ── (god_mode_v3.py lines 2025–2058) ──────────────
+
     def _parse_go_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
         funcs = re.findall(r"(?m)^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\(", content)
         types = re.findall(r"(?m)^\s*type\s+([A-Za-z_]\w*)\s+(?:struct|interface|map|chan|func|\[\])", content)
-        package_match = re.search(r"(?m)^\s*package\s+([A-Za-z_]\w*)\s*$", content)
-        package_name = package_match.group(1) if package_match else ""
+        declared_symbols = self._dedupe(funcs + types)[:20]
 
-        imports_modules: Dict[str, str] = {}
         raw_imports: Set[str] = set()
-        for alias, spec in re.findall(
-            r'(?m)^\s*import\s+(?:([A-Za-z_]\w*|_|\.)\s+)?\"([^\"]+)\"',
-            content,
-        ):
+        imports_modules: Dict[str, str] = {}
+        for spec in re.findall(r'"([^"]+)"', content):
             raw_imports.add(spec)
-            if alias:
-                imports_modules[alias] = spec
-        for block in re.findall(r"(?ms)^\s*import\s*\((.*?)\)", content):
-            for alias, spec in re.findall(r'(?m)^\s*(?:([A-Za-z_]\w*|_|\.)\s+)?\"([^\"]+)\"', block):
-                raw_imports.add(spec)
-                if alias:
-                    imports_modules[alias] = spec
+            local = spec.split("/")[-1]
+            imports_modules[local] = spec
 
+        module_name = source_group(rel_path, language)
+        if self.go_root_module:
+            rel_posix = Path(rel_path).parent.as_posix()
+            if rel_posix in {"", "."}:
+                module_name = self.go_root_module
+            else:
+                module_name = f"{self.go_root_module}/{rel_posix}"
+
+        self.go_dir_to_node[str(Path(rel_path).parent)] = f"{module_name}:{source_qualname(rel_path)}"
         return {
-            "module": source_group(rel_path, language),
+            "module": module_name,
             "qualname": source_qualname(rel_path),
             "kind": "module",
             "imports_modules": imports_modules,
             "imports_symbols": {},
-            "package_name": package_name,
-            "declared_symbols": self._dedupe(funcs + types)[:20],
+            "declared_symbols": declared_symbols,
             "raw_imports": raw_imports,
+            "raw_calls": set(),
             "raw_bases": set(),
             "raw_string_refs": self._harvest_string_refs(content, exclude=raw_imports),
         }
+
+# ── SIA src/08_parser_java.py ── (god_mode_v3.py lines 2059–3159) ────────────
+# Contains: Java, C#, Kotlin, PHP, Ruby module parsers + symbol extractors
 
     def _parse_java_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
         package_match = re.search(r"(?m)^\s*package\s+([A-Za-z0-9_.]+)\s*;", content)
@@ -3065,6 +3178,7 @@ class StructuralIntegrityAnalyzerV3:
         params, _ = self._extract_java_param_details(params_spec)
         return params
 
+# ── SIA src/09_parser_rust.py ── (god_mode_v3.py lines 3160–3219) ────────────────────
     def _parse_rust_module(self, rel_path: str, content: str, language: str) -> Dict[str, object]:
         funcs = re.findall(r"(?m)^\s*(?:pub\s+)?fn\s+([A-Za-z_]\w*)\s*\(", content)
         types = re.findall(r"(?m)^\s*(?:pub\s+)?(?:struct|enum|trait|mod)\s+([A-Za-z_]\w*)\b", content)
@@ -3125,6 +3239,8 @@ class StructuralIntegrityAnalyzerV3:
             collector.visit(stmt)
         return collector.calls
 
+
+# ── SIA src/11_graph_indices.py ── (god_mode_v3.py lines 3220–3559) ────────────────────
     def _build_indices(self) -> None:
         self.fq_to_id.clear()
         self.short_index.clear()
@@ -3358,8 +3474,7 @@ class StructuralIntegrityAnalyzerV3:
                 )
                 self._add_edge(node_id, target, "string_ref", outcome)
 
-    def _resolve_string_ref_target(self, raw: str, caller: SymbolNode) -> Optional[str]:
-        """Try to match a dotted string literal against known graph symbols."""
+    def _lookup_node_for_dotted_ref(self, raw: str) -> Optional[str]:
         if raw in self.fq_to_id:
             return self.fq_to_id[raw]
         parts = raw.split(".")
@@ -3372,6 +3487,10 @@ class StructuralIntegrityAnalyzerV3:
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def _resolve_string_ref_target(self, raw: str, caller: SymbolNode) -> Optional[str]:
+        """Try to match a dotted string literal against known graph symbols."""
+        return self._lookup_node_for_dotted_ref(raw)
 
     def _resolve_frappe_doctype_edges(self) -> None:
         """Add edges from DocType nodes to linked DocTypes and their controllers."""
@@ -3461,6 +3580,174 @@ class StructuralIntegrityAnalyzerV3:
         if class_candidates:
             return sorted(class_candidates)[0]
         return sorted(candidates)[0]
+
+
+# ── SIA src/12_taint.py ── (god_mode_v3.py lines 3560–3913) ────────────────────
+    def _compute_taint_metadata(self) -> Dict[str, object]:
+        hook_entry_nodes = self._resolve_frappe_hook_entry_nodes()
+        source_breakdown: Dict[str, int] = defaultdict(int)
+        entry_points = 0
+        tainted_param_count = 0
+
+        for node in self.nodes.values():
+            node.taint_entry = False
+            node.taint_sources = []
+            node.tainted_params = {}
+
+        for node_id in sorted(self.nodes):
+            node = self.nodes[node_id]
+            if node.kind not in SEMANTIC_EXECUTABLE_KINDS:
+                continue
+            sources = self._classify_taint_sources_for_node(node, hook_entry_nodes)
+            if not sources:
+                continue
+            node.taint_entry = True
+            node.taint_sources = sources
+            node.tainted_params = self._tainted_params_for_node(node, sources)
+            entry_points += 1
+            tainted_param_count += len(node.tainted_params)
+            for kind in node.tainted_params.values():
+                source_breakdown[kind] += 1
+
+        return {
+            "entry_points": entry_points,
+            "tainted_params": tainted_param_count,
+            "source_breakdown": {
+                kind: source_breakdown[kind]
+                for kind in _TAINT_SOURCE_KINDS
+                if source_breakdown.get(kind)
+            },
+        }
+
+    def _classify_taint_sources_for_node(self, node: SymbolNode, hook_entry_nodes: Set[str]) -> List[str]:
+        text = self._node_source_text(node, direct_semantics=True)
+        if not text:
+            return []
+
+        sources: List[str] = []
+        param_names = {param.lower() for param in node.callable_params}
+
+        if node.language == "Python":
+            if self._python_node_has_decorator(node, "frappe.whitelist"):
+                sources.append("http_param")
+            if self._python_node_has_decorator(node, "click.command"):
+                sources.append("cli_arg")
+            if node.class_context is None and node.qualname.split(".")[-1] == "main" and "sys.argv" in text:
+                sources.append("cli_arg")
+            if self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["http_param"]):
+                sources.append("http_param")
+            if (
+                node.node_id in hook_entry_nodes
+                or (
+                    self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["event_hook"])
+                    and bool(param_names & {"doc", "event", "ctx", "context"})
+                )
+            ):
+                sources.append("event_hook")
+        elif node.language in {"JavaScript", "TypeScript"} and node.exported:
+            if param_names & {"req", "request"}:
+                sources.append("http_param")
+            if param_names & {"event", "ctx", "context"}:
+                sources.append("event_hook")
+
+        if self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["cli_arg"]):
+            sources.append("cli_arg")
+        if self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["file_read"]):
+            sources.append("file_read")
+        if self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["env_var"]):
+            sources.append("env_var")
+        if self._node_has_taint_indicator(text, _TAINT_SOURCE_KINDS["external_api"]):
+            sources.append("external_api")
+        return self._sort_taint_sources(sources)
+
+    def _tainted_params_for_node(self, node: SymbolNode, sources: List[str]) -> Dict[str, str]:
+        params = [param for param in node.callable_params if param not in {"self", "cls"}]
+        if not params or not sources:
+            return {}
+
+        if node.language in {"JavaScript", "TypeScript"} and node.exported:
+            mapped: Dict[str, str] = {}
+            for param in params:
+                lower = param.lower()
+                if lower in {"req", "request"}:
+                    mapped[param] = "http_param"
+                elif lower in {"event", "ctx", "context"}:
+                    mapped[param] = "event_hook"
+            if mapped:
+                return mapped
+
+        preferred = sources[0]
+        return {param: preferred for param in params}
+
+    def _python_node_has_decorator(self, node: SymbolNode, decorator_name: str) -> bool:
+        resolved: Set[str] = set(node.callable_decorators)
+        for decorator in node.callable_decorators:
+            if decorator in node.imports_symbols:
+                resolved.add(node.imports_symbols[decorator])
+            root, dot, tail = decorator.partition(".")
+            if dot and root in node.imports_modules:
+                resolved.add(f"{node.imports_modules[root]}.{tail}")
+        return decorator_name in resolved
+
+    @staticmethod
+    def _node_has_taint_indicator(text: str, indicators: List[str]) -> bool:
+        return any(indicator in text for indicator in indicators)
+
+    def _sort_taint_sources(self, sources: Iterable[str]) -> List[str]:
+        unique = self._dedupe([source for source in sources if source in _TAINT_SOURCE_ORDER])
+        return sorted(unique, key=lambda source: (_TAINT_SOURCE_ORDER[source], source))
+
+    def _resolve_frappe_hook_entry_nodes(self) -> Set[str]:
+        hook_files = sorted({
+            node.file
+            for node in self.nodes.values()
+            if node.language == "Python" and Path(node.file).name == "hooks.py"
+        })
+        targets: Set[str] = set()
+        for rel_path in hook_files:
+            for dotted_path in self._extract_frappe_hook_paths(rel_path):
+                target = self._lookup_node_for_dotted_ref(dotted_path)
+                if target:
+                    targets.add(target)
+        return targets
+
+    def _extract_frappe_hook_paths(self, rel_path: str) -> List[str]:
+        content = self._read_project_text(rel_path)
+        if content is None:
+            return []
+        try:
+            tree = ast.parse(content, filename=rel_path)
+        except SyntaxError:
+            return []
+
+        targets: List[str] = []
+        for stmt in tree.body:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            names = [target.id for target in stmt.targets if isinstance(target, ast.Name)]
+            if not names:
+                continue
+            if not any(name in {"doc_events", "scheduler_events", "on_submit"} for name in names):
+                continue
+            targets.extend(self._extract_frappe_hook_paths_from_value(stmt.value))
+        return self._dedupe(targets)
+
+    def _extract_frappe_hook_paths_from_value(self, value: ast.AST) -> List[str]:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            candidate = value.value.strip()
+            return [candidate] if _STRING_REF_RE.match(candidate) else []
+        if isinstance(value, ast.Dict):
+            out: List[str] = []
+            for nested in value.values:
+                if nested is not None:
+                    out.extend(self._extract_frappe_hook_paths_from_value(nested))
+            return out
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            out: List[str] = []
+            for nested in value.elts:
+                out.extend(self._extract_frappe_hook_paths_from_value(nested))
+            return out
+        return []
 
     def _incoming_string_ref_sources(self, target_id: str) -> List[str]:
         return sorted(
@@ -3650,6 +3937,8 @@ class StructuralIntegrityAnalyzerV3:
     def _is_java_concrete_type(self, node: SymbolNode) -> bool:
         return node.language == "Java" and node.kind in {"class", "enum"} and not node.is_abstract
 
+
+# ── SIA src/13_graph_metrics.py ── (god_mode_v3.py lines 3914–9500) ────────────────────
     def _build_java_concrete_type_targets(self) -> None:
         self.java_concrete_type_targets.clear()
         java_types = sorted(
@@ -4870,6 +5159,9 @@ class StructuralIntegrityAnalyzerV3:
             for lineno in range(start, end + 1)
             if lineno not in excluded_lines
         ]
+
+    def _node_source_text(self, node: SymbolNode, direct_semantics: bool = False) -> str:
+        return "\n".join(text for _, text in self._node_source_lines(node, direct_semantics=direct_semantics))
 
     def _looks_like_validation_guard(self, text: str) -> bool:
         lower = f" {text.lower()} "
@@ -6384,6 +6676,14 @@ class StructuralIntegrityAnalyzerV3:
             "risk_score": node.risk_score,
             "reasons": node.reasons,
             "semantic_signals": list(node.semantic_signals),
+            **(
+                {
+                    "taint_entry": node.taint_entry,
+                    "taint_sources": list(node.taint_sources),
+                    "tainted_params": dict(node.tainted_params),
+                }
+                if self.taint_enabled else {}
+            ),
             **({"reachable_guards": sorted(node.reachable_guards)} if node.reachable_guards else {}),
             **({"architectural_warnings": list(node.architectural_warnings)} if node.architectural_warnings else {}),
             "resolved_string_refs": sorted(node.resolved_string_refs),
@@ -9226,6 +9526,8 @@ class StructuralIntegrityAnalyzerV3:
         outcome_mode: str,
         symbol_label: str,
         behavior_phrase: str,
+
+# ── SIA src/14_analysis.py ── (god_mode_v3.py lines 9501–13575) ────────────────────
         requested_phrase: str,
         context_phrase: str,
         decisive_signals: List[str],
@@ -13301,6 +13603,9 @@ class StructuralIntegrityAnalyzerV3:
         return "".join(out).strip("_") or "slice"
 
 
+
+# ── SIA src/15_worker_validation.py ── (god_mode_v3.py lines 13576–13969) ────────────────────
+
 def _validation_outcome_rank(outcome_mode: str) -> int:
     return OUTCOME_MODE_ORDER.get(str(outcome_mode or ""), -1)
 
@@ -13694,6 +13999,7 @@ def validate_worker_result_payload(
         "minimum_honest_outcome": minimum_honest,
     }
 
+# ── SIA src/16_report_builders.py ── (god_mode_v3.py lines 13970–14188) ────────────────────
 
 def build_worker_result_report(
     worker_result: Dict[str, object],
@@ -13913,6 +14219,7 @@ def build_worker_result_report(
         "contract_source": str(validation_report.get("contract_source", contract.get("contract_source", ""))),
     }
 
+# ── SIA src/17_markdown_report.py ── (god_mode_v3.py lines 14189–14332) ────────────────────
 
 def _build_markdown_report(report: Dict[str, object]) -> str:
     import datetime as _dt
@@ -14057,6 +14364,7 @@ def _build_markdown_report(report: Dict[str, object]) -> str:
 
     return "\n".join(lines)
 
+# ── SIA src/18_sia_commands.py ── (god_mode_v3.py lines 14333–14592) ────────────────────
 
 def _run_sia_why(symbol: str, report_path: str) -> None:
     import sys as _sys
@@ -14066,6 +14374,9 @@ def _run_sia_why(symbol: str, report_path: str) -> None:
             report = json.load(fh)
     except Exception as exc:
         print(f"Error loading {report_path}: {exc}", file=_sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(report, dict) or "meta" not in report:
+        print(f"Invalid or incompatible SIA report — missing required keys: {report_path}", file=_sys.stderr)
         raise SystemExit(1)
 
     risk_entry: Optional[Dict[str, object]] = None
@@ -14248,10 +14559,14 @@ def _run_sia_diff(old_path: str, new_path: str) -> None:
     def _load(path: str) -> Dict[str, object]:
         try:
             with open(path, encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
         except Exception as exc:
             print(f"Error loading {path}: {exc}", file=_sys.stderr)
             raise SystemExit(1)
+        if not isinstance(data, dict) or "meta" not in data:
+            print(f"Invalid or incompatible SIA report — missing required keys: {path}", file=_sys.stderr)
+            raise SystemExit(1)
+        return data
 
     old_data = _load(old_path)
     new_data = _load(new_path)
@@ -14310,6 +14625,7 @@ def _run_sia_diff(old_path: str, new_path: str) -> None:
     print(f"UNCHANGED: {unchanged_count} risks within +/-1.0")
     print(sep)
 
+# ── SIA src/19_cli.py ── (god_mode_v3.py lines 14593–14809) ────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deterministic structural integrity analysis for multi-language projects.")
@@ -14368,6 +14684,11 @@ def main() -> None:
         "--summary-only",
         action="store_true",
         help="Only write summary sections (top_risks/module_report/cycles), omit full nodes+edges.",
+    )
+    parser.add_argument(
+        "--taint",
+        action="store_true",
+        help="Enable taint-source classification and include taint metadata in the JSON report.",
     )
     parser.add_argument(
         "--diff",
@@ -14493,6 +14814,7 @@ def main() -> None:
         include_git_hotspots=not args.no_git_hotspots,
         ask_query=ask_query,
         ask_line_budget=max(20, args.ask_lines),
+        enable_taint=args.taint,
     )
 
     out_path = os.path.abspath(args.out)

@@ -29,6 +29,10 @@ worker_result*.json
 worker_validation*.json
 
 # SIA analysis artefacts (sprint runs, test runs, exploratory outputs)
+sprint*.json
+r1_*.json
+sia_self_report.md
+sia_bench_report.*
 sia_polyglot_*.json
 sia_polyglot_full_v*.json
 sia_workspace_v*.json

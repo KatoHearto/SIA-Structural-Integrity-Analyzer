@@ -1295,3 +1295,24 @@ wires into `StructuralIntegrityAnalyzerV3.__init__` via new `filter_languages` p
 - `meta.architectural_warning_count` added
 - Markdown report: Architectural Warnings table (severity-sorted)
 - `--why`: shows warnings for the queried symbol
+
+## Sprint 30 — Calibration Fix: `pathlib.Path` false positive (v3.60)
+
+- Removed `Path` from the Python `input_boundary` alternation pattern
+  (`\b(?:Body|Query|Form|Header|Cookie|Depends)\s*\(`)
+- `pathlib.Path(...)` no longer triggers `input_boundary`, eliminating
+  the cascade of false-positive `unguarded_entry` architectural warnings
+  on file-reading methods
+- Self-analysis: 24 → 3 architectural warnings (all remaining are genuine
+  `untrusted_deserialization` findings on JSON-loading code)
+- FastAPI route detection unaffected — 6 other patterns cover all web boundaries
+
+## Sprint 31 — Hardening: schema validation on JSON report readers (v3.61)
+
+- `_scan_frappe_json_files`: moved `isinstance(data, dict)` check inside the try block,
+  raises `ValueError` so invalid JSON objects are skipped via the unified except clause
+- `_run_sia_why`: added explicit `isinstance` + `"meta" not in` guard after `json.load`;
+  exits with a clear error message on malformed or incompatible reports
+- `_run_sia_diff._load`: same guard pattern; validates each report file before use
+- Self-analysis: `architectural_warning_count` drops from 3 → 0 (all `untrusted_deserialization`
+  warnings resolved; validation guards now detected in all three JSON-reading methods)
